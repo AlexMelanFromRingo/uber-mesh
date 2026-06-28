@@ -23,18 +23,22 @@ pub const MLKEM768_EK_LEN: usize = 1184;
 /// ML-KEM-768 ciphertext length.
 pub const MLKEM768_CT_LEN: usize = 1088;
 
-/// X-Wing-style combiner. All inputs are available to both parties after the exchange.
+/// X-Wing-style combiner. All inputs are available to both parties after the exchange. Both
+/// ephemeral X25519 public keys are bound (not just the initiator's) so a tampered responder key is
+/// cryptographically detectable in the derived secret, matching standard hybrid-binding practice.
 fn combine(
     ss_mlkem: &[u8],
     ss_x25519: &[u8; 32],
     mlkem_ct: &[u8],
     initiator_x_pub: &[u8; 32],
+    responder_x_pub: &[u8; 32],
 ) -> Hash32 {
-    let mut buf = Vec::with_capacity(ss_mlkem.len() + 32 + mlkem_ct.len() + 32);
+    let mut buf = Vec::with_capacity(ss_mlkem.len() + 32 + mlkem_ct.len() + 32 + 32);
     buf.extend_from_slice(ss_mlkem);
     buf.extend_from_slice(ss_x25519);
     buf.extend_from_slice(mlkem_ct);
     buf.extend_from_slice(initiator_x_pub);
+    buf.extend_from_slice(responder_x_pub);
     let ss = hash::derive_key(hash::labels::XWING, &buf);
     buf.zeroize();
     ss
@@ -110,6 +114,7 @@ impl Initiator {
             &ss_x,
             &resp.mlkem_ct,
             &self.x_pub,
+            &resp.x25519_pub,
         ))
     }
 }
@@ -127,7 +132,7 @@ pub fn respond(init: &InitiatorMessage) -> Result<(Hash32, ResponderMessage)> {
     let (ct, ss_pq) = ek.encapsulate();
     let mlkem_ct = ct.as_slice().to_vec();
 
-    let ss = combine(ss_pq.as_slice(), &ss_x, &mlkem_ct, &init.x25519_pub);
+    let ss = combine(ss_pq.as_slice(), &ss_x, &mlkem_ct, &init.x25519_pub, &x_pub);
     Ok((
         ss,
         ResponderMessage {
