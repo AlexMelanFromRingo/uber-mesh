@@ -126,6 +126,9 @@ injected forged/tampered/replayed messages are rejected by every node (SC-004).
   with gossipsub (Strict validation, P1–P7 scoring), identify, ping per `contracts/libp2p-protocols.md`.
 - [ ] T032 [US2] Integrate the obfs-tcp transport under libp2p Noise+yamux in
   `crates/umesh-p2p/src/transport.rs` (`Transport::and_then`). (depends on T023, T031)
+- [ ] T032b [P] [US2] Wire stock `libp2p-quic` (`quic-v1`) as an opportunistic carrier for Open/Moderate
+  profiles with a runtime UDP-availability probe in `crates/umesh-p2p/src/transport.rs` (FR-005). Note: this is
+  *plain* QUIC for open networks; *obfuscated* QUIC (Salamander) remains deferred per plan.md.
 - [ ] T033 [US2] Implement private Kademlia (`/uber-mesh/kad/1.0.0`) + rendezvous discovery in
   `crates/umesh-p2p/src/discovery.rs` (bootstrap, peer-exchange). (depends on T031)
 - [ ] T034 [US2] Wire gossipsub validation callback to T029/T030 and emit peer-score penalties on invalid msgs;
@@ -138,6 +141,11 @@ injected forged/tampered/replayed messages are rejected by every node (SC-004).
 ## Phase 5: User Story 3 — Reach peers behind NAT/CGNAT (Priority: P3)
 
 **Goal**: NATed peers participate via relay and upgrade to direct connections via hole punching where possible.
+
+> **Deferred (FR-018 partial)**: S/Kademlia *disjoint-path* eclipse hardening is intentionally deferred this
+> iteration (dossier §7 — non-trivial on rust-libp2p kad). FR-018 is covered here by creation-friction (PoW,
+> T012), invalid-message + IP-colocation peer-score penalties (T031/T034), and pubkey-derived NodeIDs. Disjoint
+> paths tracked as a follow-up feature.
 
 **Independent Test**: node behind simulated symmetric NAT joins via relay and stays reachable; compatible NATs
 upgrade to direct (SC-005).
