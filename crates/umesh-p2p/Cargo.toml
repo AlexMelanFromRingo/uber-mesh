@@ -12,6 +12,22 @@ umesh-crypto.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 lru.workspace = true
+tokio.workspace = true
+futures.workspace = true
+libp2p = { version = "0.56", features = [
+    "tokio",
+    "gossipsub",
+    "identify",
+    "ping",
+    "kad",
+    "noise",
+    "yamux",
+    "tcp",
+    "macros",
+] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true
