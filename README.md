@@ -4,9 +4,11 @@ A decentralized, **censorship-resistant** peer-to-peer mesh network in Rust, bui
 standardized, hybrid post-quantum cryptography. Designed to establish stable, private connectivity even
 under aggressive DPI — Russia's TSPU and Iran's IRGFW — and to degrade gracefully toward blackout.
 
-> **Status: working core foundation.** The cryptography, the obfuscated DPI-resilient transport, and a
-> runnable two-node CLI are implemented and tested (60 tests, green CI lints). The libp2p gossip/discovery/
-> NAT mesh (US2/US3) is specified and staged as the next iteration — see *Roadmap*.
+> **Status: working end-to-end.** Implemented and tested (70 tests, green CI lints): the hybrid-PQ crypto
+> core, the obfuscated DPI-resilient transport, the libp2p gossip overlay (gossipsub + private Kademlia +
+> AutoNAT/Relay/DCUtR), signed messages with replay protection, and a runnable CLI (`uber-mesh mesh` joins a
+> real gossip network). Remaining: layering the obfs transport *under* libp2p Noise (T032), native REALITY/
+> AmneziaWG transports, QUIC+Salamander — see *Roadmap*.
 
 Spec-driven via [GitHub Spec Kit](https://github.com/github/spec-kit): the project's iron rules live in
 [`.specify/memory/constitution.md`](.specify/memory/constitution.md); the full design is under
@@ -27,7 +29,7 @@ fully-encrypted classification, active probing, SNI/QUIC inspection, and volumet
                     │  init · run · status · keys           (umesh-node: config, keystore,     │
                     │                                        identity, runtime, status)         │
                     └───────────────────────────────────────┬─────────────────────────────────┘
-   overlay (staged) │  libp2p: gossipsub (signed+scored) · Kademlia (private) · AutoNAT/Relay/DCUtR
+   overlay          │  libp2p: gossipsub (signed+scored) · Kademlia (private) · AutoNAT/Relay/DCUtR
                     ├─────────────────────────────────────────────────────────────────────────┤
    secure channel   │  hybrid handshake  X25519 + ML-KEM-768  (X-Wing-style combiner)          │  umesh-crypto
                     │  XChaCha20-Poly1305 · Ed25519 identity · BLAKE3 CID/KDF · Merkle · PoW    │  (#![forbid(unsafe)])
@@ -45,7 +47,7 @@ fully-encrypted classification, active probing, SNI/QUIC inspection, and volumet
 |-------|------|
 | [`umesh-crypto`](crates/umesh-crypto) | Pure-Rust crypto core (no C, `#![forbid(unsafe_code)]`): hybrid X25519+ML-KEM-768 KEM, Ed25519 identity, BLAKE3, XChaCha20-Poly1305, Merkle, PoW. KATs + property tests. |
 | [`umesh-obfs`](crates/umesh-obfs) | Pluggable obfuscated transport: PSK-sealed probe-resistant handshake, AEAD record stream, traffic shaping, environment profiles, `ObfsTcp` + connect-time rotation. DPI-simulation test. |
-| [`umesh-p2p`](crates/umesh-p2p) | libp2p mesh behaviour (gossip/discovery/NAT) — *staged* (design in `contracts/libp2p-protocols.md`). |
+| [`umesh-p2p`](crates/umesh-p2p) | libp2p mesh: signed gossip + replay protection, `MeshBehaviour` (gossipsub Strict, private Kademlia, identify, ping) + NAT trio (AutoNAT v2 / Relay v2 / DCUtR), `MeshNode` driver. |
 | [`umesh-node`](crates/umesh-node) | Node orchestration: config, identity keystore, runtime, secret-free status. |
 | [`uber-mesh`](crates/uber-mesh) | CLI binary. |
 
@@ -75,7 +77,19 @@ cargo run -p uber-mesh -- --data-dir /tmp/b run --listen 127.0.0.1:4002 \
 cargo run -p uber-mesh -- --data-dir /tmp/a status --json   # never reveals secrets
 ```
 
-Fuzz the wire parser (nightly): `cargo +nightly fuzz run obfs_record` (in `fuzz/`).
+### Gossip mesh demo (libp2p: gossipsub + private Kademlia + NAT traversal)
+
+```bash
+# Node A — prints its multiaddr ".../p2p/<peerid>"
+cargo run -p uber-mesh -- --data-dir /tmp/a mesh --listen /ip4/127.0.0.1/tcp/4101
+
+# Node B — dials A; both exchange signed heartbeats on topic "uber-mesh/global"
+cargo run -p uber-mesh -- --data-dir /tmp/b mesh --listen /ip4/127.0.0.1/tcp/4102 \
+    --bootstrap /ip4/127.0.0.1/tcp/4101/p2p/<A_PEERID>
+# Each node prints "[uber-mesh/global] b3:<sender>: heartbeat …" — sender authenticated via Ed25519.
+```
+
+Fuzz the wire parsers (nightly): `cargo +nightly fuzz run obfs_record` / `message_parse` (in `fuzz/`).
 
 ## Security model (summary)
 
@@ -90,11 +104,12 @@ Fuzz the wire parser (nightly): `cargo +nightly fuzz run obfs_record` (in `fuzz/
 
 ## Roadmap
 
-Implemented: crypto core · obfs-tcp transport · profiles/shaping/rotation · node + CLI · adversarial security
-review applied. **Staged (designed, not yet built):** libp2p gossipsub + private Kademlia discovery (US2),
-AutoNAT/Relay/DCUtR NAT traversal (US3), native REALITY & AmneziaWG transports, QUIC+Salamander datapath,
-hybrid-PQ libp2p security upgrade, range-based set-reconciliation sync, local-RF blackout tier. Tracked in
-[`specs/001-uber-mesh-core/tasks.md`](specs/001-uber-mesh-core/tasks.md).
+Implemented: crypto core · obfs-tcp transport · profiles/shaping/rotation · libp2p gossip overlay
+(gossipsub + private Kademlia + AutoNAT/Relay/DCUtR) · signed messages + replay protection · node + CLI ·
+adversarial security review applied. **Remaining (designed):** layer the obfs transport *under* libp2p
+Noise so the mesh inherits DPI resistance (T032), native REALITY & AmneziaWG transports, QUIC+Salamander
+datapath, hybrid-PQ libp2p security upgrade, range-based set-reconciliation sync, local-RF blackout tier.
+Tracked in [`specs/001-uber-mesh-core/tasks.md`](specs/001-uber-mesh-core/tasks.md).
 
 ## License
 

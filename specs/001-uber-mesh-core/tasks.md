@@ -22,9 +22,13 @@ constitution Principle V (NON-NEGOTIABLE). Other tasks include tests where they 
 - ✅ **Phase 6 US4** (T039–T045) — config, keystore, status, node runtime, CLI; two-node demo verified. `c6070df`
 - ✅ **Adversarial security review** applied (4-lens) — handshake PSK-sealing, combiner binding, AAD counter,
   DoS bounds, checked conversions. `e3f16d8`
-- ✅ **Polish** — fuzz harness (`fuzz/`, T014/T046), README, supply-chain policy. (cargo-deny runs in CI.)
-- ⏳ **Staged next** — **Phase 4 US2** (libp2p gossip + private Kademlia discovery, T027–T034, T032b),
-  **Phase 5 US3** (AutoNAT/Relay/DCUtR NAT traversal, T035–T038). Designs in `contracts/`; `umesh-p2p` skeleton present.
+- ✅ **Phase 4 US2** (T027, T029–T034) — signed gossip + replay protection, libp2p `MeshBehaviour`
+  (gossipsub Strict + private Kademlia + identify + ping), `MeshNode`; two-node gossip integration test. `c96220f`, `73d1915`
+- ✅ **Phase 5 US3** (T035–T037) — AutoNAT v2 + Circuit Relay v2 + DCUtR wired into the behaviour. `e913e1c`
+- ✅ **CLI mesh** — `uber-mesh mesh` runs the gossip overlay; verified two-process signed-heartbeat exchange. `b5ad1ab`
+- ✅ **Polish** — fuzz harnesses (`fuzz/`: obfs_record + message_parse), README, supply-chain policy.
+- ⏳ **Remaining (designed)** — T032 (obfs transport *under* libp2p Noise, so the mesh inherits DPI resistance),
+  T038 (NAT integration test), native REALITY/AmneziaWG, QUIC+Salamander, hybrid-PQ libp2p security upgrade.
 
 ## Format: `[ID] [P?] [Story] Description`
 
