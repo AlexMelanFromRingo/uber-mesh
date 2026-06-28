@@ -24,6 +24,9 @@ libp2p = { version = "0.56", features = [
     "yamux",
     "tcp",
     "macros",
+    "autonat",
+    "relay",
+    "dcutr",
 ] }
 
 [dev-dependencies]

@@ -1,18 +1,19 @@
 //! The composed libp2p `NetworkBehaviour` and swarm builder.
 //!
 //! Combines gossipsub (signed, strict validation, our content-derived message-id), a **private**
-//! Kademlia DHT (`/uber-mesh/kad/1.0.0` — not enumerable on the public IPFS DHT), identify, and ping
-//! (contracts/libp2p-protocols.md). The libp2p transport identity is derived from the same Ed25519
-//! seed as the node's [`umesh_crypto`] identity, but note libp2p's PeerId (a multihash of the public
-//! key) differs from uber-mesh's `BLAKE3(pubkey)` PeerId used at the application/gossip layer.
+//! Kademlia DHT (`/uber-mesh/kad/1.0.0` — not enumerable on the public IPFS DHT), identify, ping,
+//! and the NAT-traversal trio: AutoNAT v2 (reachability), Circuit Relay v2 (server + client), and
+//! DCUtR (hole punching) — research D9. The libp2p transport identity is derived from the same
+//! Ed25519 seed as the node's [`umesh_crypto`] identity, but libp2p's PeerId (a multihash of the
+//! public key) differs from uber-mesh's `BLAKE3(pubkey)` PeerId used at the application/gossip layer.
 
 use std::time::Duration;
 
 use libp2p::kad::store::MemoryStore;
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::{
-    StreamProtocol, Swarm, SwarmBuilder, gossipsub, identify, identity, kad, noise, ping, tcp,
-    yamux,
+    StreamProtocol, Swarm, SwarmBuilder, autonat, dcutr, gossipsub, identify, identity, kad, noise,
+    ping, relay, tcp, yamux,
 };
 
 use umesh_crypto::hash;
@@ -37,6 +38,14 @@ pub struct MeshBehaviour {
     pub identify: identify::Behaviour,
     /// Liveness.
     pub ping: ping::Behaviour,
+    /// NAT reachability detection (dial-back).
+    pub autonat: autonat::v2::client::Behaviour,
+    /// Circuit Relay v2 server (this node relays for others when reachable).
+    pub relay: relay::Behaviour,
+    /// Circuit Relay v2 client (reach unreachable peers via a relay).
+    pub relay_client: relay::client::Behaviour,
+    /// Direct Connection Upgrade through Relay (coordinated hole punching).
+    pub dcutr: dcutr::Behaviour,
 }
 
 /// gossipsub message-id = our content-derived [`crate::gossip::SignedMessage::message_id`] when the
@@ -50,6 +59,7 @@ fn message_id(msg: &gossipsub::Message) -> gossipsub::MessageId {
 
 fn build_behaviour(
     key: &identity::Keypair,
+    relay_client: relay::client::Behaviour,
 ) -> Result<MeshBehaviour, Box<dyn std::error::Error + Send + Sync>> {
     let local_peer_id = key.public().to_peer_id();
 
@@ -83,13 +93,18 @@ fn build_behaviour(
         kademlia,
         identify,
         ping: ping::Behaviour::default(),
+        autonat: autonat::v2::client::Behaviour::default(),
+        relay: relay::Behaviour::new(local_peer_id, relay::Config::default()),
+        relay_client,
+        dcutr: dcutr::Behaviour::new(local_peer_id),
     })
 }
 
-/// Build a Tokio-backed swarm with the mesh behaviour over TCP + Noise + Yamux.
+/// Build a Tokio-backed swarm with the mesh behaviour over TCP + Noise + Yamux, with a Circuit
+/// Relay v2 client transport for NAT traversal.
 ///
 /// The obfuscated transport is layered under Noise in a later step (T032); this builds the overlay
-/// on the stock secure transport so the gossip/discovery layer is testable now.
+/// on the stock secure transport so the gossip/discovery/NAT layer is testable now.
 pub fn build_swarm(seed: &[u8; 32]) -> Result<Swarm<MeshBehaviour>, P2pError> {
     let keypair =
         identity::Keypair::ed25519_from_bytes(*seed).map_err(|e| P2pError::Init(e.to_string()))?;
@@ -101,6 +116,8 @@ pub fn build_swarm(seed: &[u8; 32]) -> Result<Swarm<MeshBehaviour>, P2pError> {
             noise::Config::new,
             yamux::Config::default,
         )
+        .map_err(|e| P2pError::Init(e.to_string()))?
+        .with_relay_client(noise::Config::new, yamux::Config::default)
         .map_err(|e| P2pError::Init(e.to_string()))?
         .with_behaviour(build_behaviour)
         .map_err(|e| P2pError::Init(e.to_string()))?
