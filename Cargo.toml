@@ -1,6 +1,56 @@
-[package]
-name = "uber-mesh"
+[workspace]
+resolver = "3"
+members = [
+    "crates/umesh-crypto",
+    "crates/umesh-obfs",
+    "crates/umesh-p2p",
+    "crates/umesh-node",
+    "crates/uber-mesh",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MPL-2.0"
+authors = ["uber-mesh contributors"]
+repository = "https://github.com/AlexMelanFromRingo/uber-mesh"
+rust-version = "1.85"
 
-[dependencies]
+# Default-deny unsafe across the workspace (constitution Principle IV).
+# The crypto crate additionally `#![forbid(unsafe_code)]`.
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[workspace.dependencies]
+# --- crypto (pure-Rust core) ---
+blake3 = "1.8"
+ed25519-dalek = { version = "2.2", features = ["rand_core", "zeroize"] }
+x25519-dalek = { version = "2", features = ["zeroize", "static_secrets"] }
+ml-kem = { version = "0.3", features = ["getrandom"] }
+chacha20poly1305 = { version = "0.11", features = ["alloc"] }
+rs_merkle = "1.5"
+rand = "0.8"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+subtle = "2"
+hex = "0.4"
+
+# --- shared infra ---
+thiserror = "2"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+
+# --- dev / test ---
+proptest = "1"
+
+# internal crates
+umesh-crypto = { path = "crates/umesh-crypto" }
+umesh-obfs = { path = "crates/umesh-obfs" }
+umesh-p2p = { path = "crates/umesh-p2p" }
+umesh-node = { path = "crates/umesh-node" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

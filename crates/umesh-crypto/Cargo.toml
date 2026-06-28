@@ -1,0 +1,28 @@
+[package]
+name = "umesh-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Pure-Rust crypto core for uber-mesh: hybrid X25519+ML-KEM-768, Ed25519, BLAKE3, XChaCha20-Poly1305, Merkle, PoW"
+
+[dependencies]
+blake3.workspace = true
+ed25519-dalek.workspace = true
+x25519-dalek.workspace = true
+ml-kem.workspace = true
+chacha20poly1305.workspace = true
+rs_merkle.workspace = true
+rand.workspace = true
+zeroize.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+proptest.workspace = true
+x25519-dalek.workspace = true
+
+[lints]
+workspace = true

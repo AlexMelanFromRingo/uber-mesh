@@ -1,0 +1,38 @@
+# cargo-deny supply-chain policy (constitution Principle VII).
+# Run: cargo deny check
+
+[advisories]
+version = 2
+# Fail the build on any security advisory or unmaintained/yanked crate.
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# Permissive + weak-copyleft licenses acceptable for a security tool we ship as MPL-2.0.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "Zlib",
+    "CC0-1.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Surface accidental dependency bloat / duplicate major versions for review.
+multiple-versions = "warn"
+wildcards = "deny"
+# Never link a second TLS/crypto stack by accident in the default (pure-Rust) build.
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
