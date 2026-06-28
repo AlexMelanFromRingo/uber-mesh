@@ -10,10 +10,18 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 umesh-obfs = { path = "../crates/umesh-obfs" }
+umesh-p2p = { path = "../crates/umesh-p2p" }
 
 [[bin]]
 name = "obfs_record"
 path = "fuzz_targets/obfs_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "message_parse"
+path = "fuzz_targets/message_parse.rs"
 test = false
 doc = false
 bench = false
