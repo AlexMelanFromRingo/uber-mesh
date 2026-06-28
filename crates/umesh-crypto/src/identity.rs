@@ -98,6 +98,11 @@ impl NodeIdentity {
     pub fn sign(&self, msg: &[u8]) -> Signature {
         self.signing.sign(msg)
     }
+
+    /// Sign a message, returning the raw 64-byte signature (convenience for wire encoding).
+    pub fn sign_bytes(&self, msg: &[u8]) -> [u8; SIGNATURE_LEN] {
+        self.signing.sign(msg).to_bytes()
+    }
 }
 
 impl fmt::Debug for NodeIdentity {
@@ -116,6 +121,18 @@ pub fn verify_strict(vk: &VerifyingKey, msg: &[u8], sig: &Signature) -> Result<(
 /// Parse a verifying key from 32 bytes.
 pub fn verifying_key_from_bytes(bytes: &[u8; 32]) -> Result<VerifyingKey> {
     VerifyingKey::from_bytes(bytes).map_err(|_| CryptoError::MalformedKey)
+}
+
+/// Verify a raw signature over `msg` under a raw verifying key, returning the bound [`PeerId`].
+///
+/// On success the caller knows both that the signature is valid AND that `vk_bytes` derives the
+/// returned PeerId (identity binding). Uses `verify_strict` to reject malleable signatures.
+pub fn verify(vk_bytes: &[u8; 32], msg: &[u8], sig_bytes: &[u8; SIGNATURE_LEN]) -> Result<PeerId> {
+    let vk = verifying_key_from_bytes(vk_bytes)?;
+    let sig = Signature::from_bytes(sig_bytes);
+    vk.verify_strict(msg, &sig)
+        .map_err(|_| CryptoError::BadSignature)?;
+    Ok(PeerId::from_verifying_key(&vk))
 }
 
 #[cfg(test)]
