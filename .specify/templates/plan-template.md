@@ -40,7 +40,26 @@
 
 *GATE: Must pass before Phase 0 research. Re-check after Phase 1 design.*
 
-[Gates determined based on constitution file]
+Derived from `.specify/memory/constitution.md` v1.0.0. Mark each gate PASS / FAIL / N/A with a note.
+
+- [ ] **I. Security & Cryptography First** — only standardized primitives from audited/maintained crates;
+  no hand-rolled crypto; hybrid PQ key agreement (classical authoritative); constant-time + zeroize +
+  domain separation; AEAD-only on the wire. *(NON-NEGOTIABLE)*
+- [ ] **II. Censorship-Resilience by Design** — wire transports pluggable behind `ObfsTransport`, no static
+  fingerprint, probe-resistant auth, environment-profile selectable, hostile-safe defaults.
+- [ ] **III. Decentralization & Self-Sovereign Identity** — no mandatory central server; keypair-derived
+  identity (`PeerID = BLAKE3(pubkey)`); functions under partial/adversarial peer availability.
+- [ ] **IV. Memory Safety & Pure-Rust Preference** — safe Rust by default; justified+tested `unsafe`;
+  C/FFI only behind feature flags, never in default core build; warning-clean.
+- [ ] **V. Test-First & Cryptographic Verification** — unit + KAT + property tests and parser fuzz harnesses
+  precede merge; interop claims need conformance tests; green CI. *(NON-NEGOTIABLE)*
+- [ ] **VI. Observability & Operability** — `tracing` structured logs (no secrets); health-checked
+  transports with rotation; human + JSON CLI.
+- [ ] **VII. Simplicity, Versioning & Supply-Chain Integrity** — YAGNI; minimal pinned+audited deps;
+  SemVer; documented/versioned wire formats.
+
+Any FAIL must be justified in Complexity Tracking with the rejected simpler alternative. Principles I and V
+cannot be waived.
 
 ## Project Structure
 
