@@ -41,6 +41,8 @@ hex = "0.4"
 thiserror = "2"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }
+futures = "0.3"
 
 # --- dev / test ---
 proptest = "1"

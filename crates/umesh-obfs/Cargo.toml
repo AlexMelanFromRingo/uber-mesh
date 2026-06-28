@@ -11,6 +11,12 @@ description = "Pluggable obfuscated transport layer for uber-mesh (ObfsTransport
 umesh-crypto.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+tokio.workspace = true
+futures.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
