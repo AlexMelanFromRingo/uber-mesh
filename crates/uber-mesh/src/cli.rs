@@ -44,6 +44,18 @@ pub enum Command {
         #[arg(long)]
         psk: Option<String>,
     },
+    /// Run the libp2p gossip mesh overlay (gossipsub + private Kademlia + NAT traversal).
+    Mesh {
+        /// Listen multiaddr (default /ip4/0.0.0.0/tcp/0).
+        #[arg(long)]
+        listen: Option<String>,
+        /// Bootstrap peer multiaddrs to dial, e.g. /ip4/1.2.3.4/tcp/4001/p2p/<peerid> (repeatable).
+        #[arg(long = "bootstrap")]
+        bootstrap: Vec<String>,
+        /// Gossip topic to join (default uber-mesh/global).
+        #[arg(long)]
+        topic: Option<String>,
+    },
     /// Show node status (peers, transports, reachability) — never reveals secrets.
     Status,
     /// Key management.

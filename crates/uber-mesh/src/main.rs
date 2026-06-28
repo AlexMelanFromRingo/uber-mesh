@@ -51,7 +51,73 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(cmd_run(&dd, profile, listen, bootstrap, psk))
         }
+        Command::Mesh {
+            listen,
+            bootstrap,
+            topic,
+        } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(cmd_mesh(&dd, listen, bootstrap, topic))
+        }
     }
+}
+
+async fn cmd_mesh(
+    dd: &DataDir,
+    listen: Option<String>,
+    bootstrap: Vec<String>,
+    topic: Option<String>,
+) -> anyhow::Result<()> {
+    use std::time::Duration;
+    use umesh_p2p::{MeshEvent, MeshNode};
+
+    let id = keystore::load(&dd.identity())
+        .with_context(|| format!("loading identity from {}", dd.identity().display()))?;
+    let seed = id.to_seed_bytes();
+    let mut node = MeshNode::new(&seed).context("building mesh node")?;
+
+    let topic = topic.unwrap_or_else(|| "uber-mesh/global".to_string());
+    node.subscribe(&topic).context("subscribe")?;
+    let listen = listen.unwrap_or_else(|| "/ip4/0.0.0.0/tcp/0".to_string());
+    node.listen(&listen).context("listen")?;
+    for b in &bootstrap {
+        if let Err(e) = node.dial(b) {
+            tracing::warn!(addr = %b, error = %e, "bootstrap dial failed");
+        }
+    }
+
+    println!(
+        "uber-mesh gossip node started\n  libp2p peer: {}\n  app peer:    {}\n  topic:       {}",
+        node.local_peer_id(),
+        node.app_peer_id(),
+        topic
+    );
+
+    let local = node.local_peer_id();
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+    let ctrlc = tokio::signal::ctrl_c();
+    tokio::pin!(ctrlc);
+    loop {
+        tokio::select! {
+            ev = node.next_event() => match ev {
+                MeshEvent::Listening(addr) => println!("listening on {addr}/p2p/{local}"),
+                MeshEvent::PeerConnected(p) => tracing::info!(peer = %p, "peer connected"),
+                MeshEvent::PeerDisconnected(p) => tracing::info!(peer = %p, "peer disconnected"),
+                MeshEvent::Message { topic, sender, payload } => {
+                    println!("[{topic}] {sender}: {}", String::from_utf8_lossy(&payload));
+                }
+            },
+            _ = heartbeat.tick() => {
+                let msg = format!("heartbeat from {}", node.app_peer_id());
+                let _ = node.publish(&topic, msg.into_bytes());
+            }
+            _ = &mut ctrlc => {
+                tracing::info!("shutting down");
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn cmd_init(dd: &DataDir, force: bool) -> anyhow::Result<()> {
