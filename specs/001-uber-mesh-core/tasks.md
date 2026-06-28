@@ -13,6 +13,19 @@ constitution Principle V (NON-NEGOTIABLE). Other tasks include tests where they 
 
 **Organization**: Grouped by user story (US1=P1 MVP, US2=P2, US3=P3, US4=P3) for independent delivery.
 
+## Implementation status (2026-06-28)
+
+- ✅ **Phase 1 Setup** (T001–T004) — workspace, lints, `deny.toml`, CI. `462dd19`/`e4ecb47`
+- ✅ **Phase 2 Foundational `umesh-crypto`** (T005–T013) — all modules + KATs + property tests (33 tests). `e4ecb47`
+- ✅ **Phase 3 US1 (MVP)** (T014, T016–T024, T026) — obfs-tcp transport, probe resistance, hybrid-PQ handshake,
+  shaping, profiles, rotation; DPI-simulation test passes over real TCP. `e4eb924`, hardened in `e3f16d8`.
+- ✅ **Phase 6 US4** (T039–T045) — config, keystore, status, node runtime, CLI; two-node demo verified. `c6070df`
+- ✅ **Adversarial security review** applied (4-lens) — handshake PSK-sealing, combiner binding, AAD counter,
+  DoS bounds, checked conversions. `e3f16d8`
+- ✅ **Polish** — fuzz harness (`fuzz/`, T014/T046), README, supply-chain policy. (cargo-deny runs in CI.)
+- ⏳ **Staged next** — **Phase 4 US2** (libp2p gossip + private Kademlia discovery, T027–T034, T032b),
+  **Phase 5 US3** (AutoNAT/Relay/DCUtR NAT traversal, T035–T038). Designs in `contracts/`; `umesh-p2p` skeleton present.
+
 ## Format: `[ID] [P?] [Story] Description`
 
 - **[P]**: parallelizable (different files, no incomplete-task dependency)

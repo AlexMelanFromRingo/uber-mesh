@@ -43,6 +43,26 @@ pub async fn read_record<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Synchronous, pure parser for one TLS-record-framed message in an in-memory buffer.
+///
+/// Returns `(payload, bytes_consumed)`, or `None` if the buffer does not yet hold a complete record
+/// or declares an oversized length. This is the fuzz target for the framing parser (it must never
+/// panic on arbitrary input).
+pub fn parse_record(buf: &[u8]) -> Option<(&[u8], usize)> {
+    if buf.len() < HEADER_LEN {
+        return None;
+    }
+    let len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+    if len > MAX_RECORD {
+        return None;
+    }
+    let end = HEADER_LEN.checked_add(len)?;
+    if buf.len() < end {
+        return None;
+    }
+    Some((&buf[HEADER_LEN..end], end))
+}
+
 /// Fraction of set bits per byte over `data` (a coarse proxy for the GFW's popcount heuristic).
 /// Fully-random/encrypted payloads sit near 4.0; structured/text data sits lower.
 pub fn popcount_per_byte(data: &[u8]) -> f64 {
@@ -104,5 +124,21 @@ mod tests {
             .map(|i| (i.wrapping_mul(53) ^ 0xa7) as u8)
             .collect();
         assert!(looks_fully_encrypted(&raw) || popcount_per_byte(&raw) < 3.4);
+    }
+
+    #[test]
+    fn parse_record_never_panics_and_bounds() {
+        // Too short.
+        assert!(parse_record(&[0x17, 0x03]).is_none());
+        // Declares more than it holds.
+        assert!(parse_record(&[0x17, 0x03, 0x03, 0x10, 0x00, 0x00]).is_none());
+        // Well-formed small record.
+        let rec = [0x17, 0x03, 0x03, 0x00, 0x02, 0xAA, 0xBB];
+        let (payload, consumed) = parse_record(&rec).unwrap();
+        assert_eq!(payload, &[0xAA, 0xBB]);
+        assert_eq!(consumed, 7);
+        // Oversized declared length is rejected (no huge allocation).
+        let big = [0x17, 0x03, 0x03, 0xFF, 0xFF];
+        assert!(parse_record(&big).is_none());
     }
 }

@@ -1,0 +1,22 @@
+[package]
+name = "uber-mesh-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+umesh-obfs = { path = "../crates/umesh-obfs" }
+
+[[bin]]
+name = "obfs_record"
+path = "fuzz_targets/obfs_record.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+# Standalone workspace so the nightly/libfuzzer toolchain doesn't affect the main build.
