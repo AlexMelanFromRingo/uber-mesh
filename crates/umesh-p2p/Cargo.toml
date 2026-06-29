@@ -9,10 +9,12 @@ description = "libp2p mesh behaviour for uber-mesh (signed gossip, discovery, NA
 
 [dependencies]
 umesh-crypto.workspace = true
+umesh-obfs.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 lru.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 futures.workspace = true
 libp2p = { version = "0.56", features = [
     "tokio",

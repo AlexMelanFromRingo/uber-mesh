@@ -5,6 +5,7 @@ use futures::StreamExt;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId, Swarm, gossipsub};
 use umesh_crypto::identity::NodeIdentity;
+use umesh_obfs::ObfsPsk;
 
 use crate::behaviour::{MeshBehaviour, MeshBehaviourEvent};
 use crate::error::{P2pError, Result};
@@ -39,10 +40,11 @@ pub struct MeshNode {
 }
 
 impl MeshNode {
-    /// Build a mesh node from a 32-byte Ed25519 seed (shared with the application identity).
-    pub fn new(seed: &[u8; 32]) -> Result<Self> {
+    /// Build a mesh node from a 32-byte Ed25519 seed (shared with the application identity) and the
+    /// obfs PSK that gates the obfuscated carrier (shared out-of-band among the cohort).
+    pub fn new(seed: &[u8; 32], psk: ObfsPsk) -> Result<Self> {
         Ok(MeshNode {
-            swarm: crate::behaviour::build_swarm(seed)?,
+            swarm: crate::behaviour::build_swarm(seed, psk)?,
             identity: NodeIdentity::from_seed(seed),
             guard: ReplayGuard::default(),
             seqno: 0,

@@ -4,12 +4,15 @@
 
 use std::time::Duration;
 
+use umesh_obfs::ObfsPsk;
 use umesh_p2p::{MeshEvent, MeshNode};
 
 #[tokio::test]
 async fn two_nodes_gossip_a_validated_message() {
-    let mut a = MeshNode::new(&[1u8; 32]).unwrap();
-    let mut b = MeshNode::new(&[2u8; 32]).unwrap();
+    // Both nodes share the same obfs PSK (the bridge secret gating the obfuscated carrier).
+    let psk = ObfsPsk([7u8; 32]);
+    let mut a = MeshNode::new(&[1u8; 32], psk.clone()).unwrap();
+    let mut b = MeshNode::new(&[2u8; 32], psk).unwrap();
     let a_app_id = a.app_peer_id();
 
     let topic = "uber-mesh/test";
@@ -54,5 +57,37 @@ async fn two_nodes_gossip_a_validated_message() {
     assert!(
         result.is_ok(),
         "B did not receive A's gossip message within the timeout"
+    );
+}
+
+/// A peer with the wrong obfs PSK must NOT form a connection — the obfuscated carrier's gate rejects
+/// it before any libp2p Noise upgrade (T032: the mesh inherits probe resistance).
+#[tokio::test]
+async fn mismatched_psk_cannot_connect() {
+    let mut a = MeshNode::new(&[3u8; 32], ObfsPsk([1u8; 32])).unwrap();
+    let mut b = MeshNode::new(&[4u8; 32], ObfsPsk([2u8; 32])).unwrap(); // different PSK
+
+    a.listen("/ip4/127.0.0.1/tcp/0").unwrap();
+    let a_addr = loop {
+        if let MeshEvent::Listening(addr) = a.next_event().await {
+            break addr;
+        }
+    };
+    b.dial(&a_addr.to_string()).unwrap();
+
+    // Drive both for a window; neither side may reach PeerConnected. Timeout (Err) ⇒ success.
+    let connected = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            tokio::select! {
+                ev = a.next_event() => if matches!(ev, MeshEvent::PeerConnected(_)) { return true; },
+                ev = b.next_event() => if matches!(ev, MeshEvent::PeerConnected(_)) { return true; },
+            }
+        }
+    })
+    .await;
+
+    assert!(
+        connected.is_err(),
+        "peers with mismatched PSK must not connect"
     );
 }

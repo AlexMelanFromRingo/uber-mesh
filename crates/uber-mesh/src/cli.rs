@@ -55,6 +55,9 @@ pub enum Command {
         /// Gossip topic to join (default uber-mesh/global).
         #[arg(long)]
         topic: Option<String>,
+        /// Override the obfs PSK (hex, 32 bytes) gating the obfuscated carrier; defaults to config.
+        #[arg(long)]
+        psk: Option<String>,
     },
     /// Show node status (peers, transports, reachability) — never reveals secrets.
     Status,

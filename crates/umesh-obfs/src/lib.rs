@@ -12,6 +12,7 @@
 //! - [`profile`]: environment profiles that select transport + shaping.
 //! - [`transport`]: the concrete `ObfsTcp` carrier + connect-time rotation.
 
+pub mod bytestream;
 pub mod error;
 pub mod handshake;
 pub mod profile;
@@ -20,8 +21,9 @@ pub mod shaping;
 pub mod transport;
 pub mod wire;
 
+pub use bytestream::ObfsByteStream;
 pub use error::{ObfsError, Result};
-pub use handshake::{ObfsPsk, SessionKeys};
+pub use handshake::{ObfsPsk, SessionKeys, client_handshake, server_handshake};
 pub use profile::{Profile, TransportKind};
 pub use secure::SecureStream;
 pub use shaping::ShapingPolicy;

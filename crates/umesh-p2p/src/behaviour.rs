@@ -7,14 +7,19 @@
 //! Ed25519 seed as the node's [`umesh_crypto`] identity, but libp2p's PeerId (a multihash of the
 //! public key) differs from uber-mesh's `BLAKE3(pubkey)` PeerId used at the application/gossip layer.
 
+use std::io;
 use std::time::Duration;
 
+use libp2p::core::transport::Transport as _;
+use libp2p::core::upgrade::Version;
 use libp2p::kad::store::MemoryStore;
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::{
     StreamProtocol, Swarm, SwarmBuilder, autonat, dcutr, gossipsub, identify, identity, kad, noise,
     ping, relay, tcp, yamux,
 };
+use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
+use umesh_obfs::{ObfsByteStream, ObfsPsk, client_handshake, server_handshake};
 
 use umesh_crypto::hash;
 
@@ -100,22 +105,40 @@ fn build_behaviour(
     })
 }
 
-/// Build a Tokio-backed swarm with the mesh behaviour over TCP + Noise + Yamux, with a Circuit
-/// Relay v2 client transport for NAT traversal.
-///
-/// The obfuscated transport is layered under Noise in a later step (T032); this builds the overlay
-/// on the stock secure transport so the gossip/discovery/NAT layer is testable now.
-pub fn build_swarm(seed: &[u8; 32]) -> Result<Swarm<MeshBehaviour>, P2pError> {
+/// Build a Tokio-backed swarm whose base transport is the **obfuscated, probe-resistant obfs-tcp
+/// carrier under libp2p Noise + Yamux** (T032): `TCP → obfs handshake → ObfsByteStream →
+/// .upgrade().authenticate(noise).multiplex(yamux)`. The obfs layer (gated by `psk`) hides Noise's
+/// fingerprint and gives the whole mesh DPI resistance; Noise still authenticates the libp2p PeerId.
+/// A Circuit Relay v2 client transport is layered on for NAT traversal.
+pub fn build_swarm(seed: &[u8; 32], psk: ObfsPsk) -> Result<Swarm<MeshBehaviour>, P2pError> {
     let keypair =
         identity::Keypair::ed25519_from_bytes(*seed).map_err(|e| P2pError::Init(e.to_string()))?;
 
     let swarm = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
-        .with_tcp(
-            tcp::Config::default(),
-            noise::Config::new,
-            yamux::Config::default,
-        )
+        .with_other_transport(move |keypair| {
+            let noise = noise::Config::new(keypair)?;
+            let transport = tcp::tokio::Transport::new(tcp::Config::default())
+                .and_then(move |conn, point| {
+                    let psk = psk.clone();
+                    async move {
+                        // Bridge libp2p's futures-io stream to our tokio-based obfs handshake.
+                        let mut tk = conn.compat();
+                        let keys = if point.is_dialer() {
+                            client_handshake(&mut tk, &psk).await
+                        } else {
+                            server_handshake(&mut tk, &psk).await
+                        }
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                        // Expose the obfs byte stream back as futures-io for the Noise/Yamux upgrade.
+                        Ok::<_, io::Error>(ObfsByteStream::new(tk, keys).compat())
+                    }
+                })
+                .upgrade(Version::V1)
+                .authenticate(noise)
+                .multiplex(yamux::Config::default());
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(transport)
+        })
         .map_err(|e| P2pError::Init(e.to_string()))?
         .with_relay_client(noise::Config::new, yamux::Config::default)
         .map_err(|e| P2pError::Init(e.to_string()))?

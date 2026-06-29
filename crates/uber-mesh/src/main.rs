@@ -55,9 +55,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             listen,
             bootstrap,
             topic,
+            psk,
         } => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(cmd_mesh(&dd, listen, bootstrap, topic))
+            rt.block_on(cmd_mesh(&dd, listen, bootstrap, topic, psk))
         }
     }
 }
@@ -67,14 +68,22 @@ async fn cmd_mesh(
     listen: Option<String>,
     bootstrap: Vec<String>,
     topic: Option<String>,
+    psk: Option<String>,
 ) -> anyhow::Result<()> {
     use std::time::Duration;
     use umesh_p2p::{MeshEvent, MeshNode};
 
     let id = keystore::load(&dd.identity())
         .with_context(|| format!("loading identity from {}", dd.identity().display()))?;
+    // PSK: --psk override, else from config (the shared bridge secret gating the obfs carrier).
+    let mut cfg = Config::load(&dd.config())
+        .with_context(|| format!("loading config from {}", dd.config().display()))?;
+    if let Some(p) = psk {
+        cfg.psk_hex = p;
+    }
+    let psk = cfg.psk().context("invalid obfs PSK")?;
     let seed = id.to_seed_bytes();
-    let mut node = MeshNode::new(&seed).context("building mesh node")?;
+    let mut node = MeshNode::new(&seed, psk).context("building mesh node")?;
 
     let topic = topic.unwrap_or_else(|| "uber-mesh/global".to_string());
     node.subscribe(&topic).context("subscribe")?;
