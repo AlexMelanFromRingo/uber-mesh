@@ -26,9 +26,12 @@ constitution Principle V (NON-NEGOTIABLE). Other tasks include tests where they 
   (gossipsub Strict + private Kademlia + identify + ping), `MeshNode`; two-node gossip integration test. `c96220f`, `73d1915`
 - ✅ **Phase 5 US3** (T035–T037) — AutoNAT v2 + Circuit Relay v2 + DCUtR wired into the behaviour. `e913e1c`
 - ✅ **CLI mesh** — `uber-mesh mesh` runs the gossip overlay; verified two-process signed-heartbeat exchange. `b5ad1ab`
+- ✅ **T032 — obfs transport under libp2p Noise** — `ObfsByteStream` (poll-based AsyncRead/Write over the obfs
+  AEAD framing) + `with_other_transport` wraps TCP with the PSK-gated obfs handshake under Noise+Yamux. The
+  mesh now inherits probe resistance; a wrong-PSK peer cannot connect (integration + cross-process tests). `68e4038`
 - ✅ **Polish** — fuzz harnesses (`fuzz/`: obfs_record + message_parse), README, supply-chain policy.
-- ⏳ **Remaining (designed)** — T032 (obfs transport *under* libp2p Noise, so the mesh inherits DPI resistance),
-  T038 (NAT integration test), native REALITY/AmneziaWG, QUIC+Salamander, hybrid-PQ libp2p security upgrade.
+- ⏳ **Remaining (designed)** — native REALITY/AmneziaWG transports, QUIC+Salamander datapath, hybrid-PQ libp2p
+  security upgrade (replace stock Noise), range-based set-reconciliation sync, local-RF blackout tier, T038 NAT test.
 
 ## Format: `[ID] [P?] [Story] Description`
 
