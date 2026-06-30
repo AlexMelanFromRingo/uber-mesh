@@ -4,13 +4,15 @@ A decentralized, **censorship-resistant** peer-to-peer mesh network in Rust, bui
 standardized, hybrid post-quantum cryptography. Designed to establish stable, private connectivity even
 under aggressive DPI — Russia's TSPU and Iran's IRGFW — and to degrade gracefully toward blackout.
 
-> **Status: working end-to-end.** Implemented and tested (80 tests, green CI lints): the hybrid-PQ crypto
+> **Status: working end-to-end.** Implemented and tested (85 tests, green CI lints): the hybrid-PQ crypto
 > core, the obfuscated DPI-resilient transport **layered under libp2p Noise** so the whole gossip mesh
-> inherits its probe resistance, the libp2p overlay (gossipsub + private Kademlia + AutoNAT/Relay/DCUtR),
-> signed messages with replay protection, **content exchange** (request/serve verified blobs by `Cid`), and
-> a runnable CLI (`uber-mesh mesh` joins a real gossip network over the obfuscated carrier; peers with the
-> wrong PSK can't connect). Remaining: native REALITY/AmneziaWG transports, QUIC+Salamander, a hybrid-PQ
-> libp2p security upgrade — see *Roadmap*.
+> inherits its probe resistance (incl. REALITY-style fallback-to-cover-site), the libp2p overlay (gossipsub +
+> private Kademlia + AutoNAT/Relay/DCUtR), signed messages with replay protection, **content exchange**
+> (request/serve verified blobs by `Cid`), **set reconciliation** (negentropy-style sync of content sets),
+> and a runnable CLI (`uber-mesh mesh`). All mesh data is hybrid-PQ-protected end to end (the obfs layer
+> carries everything, including Noise). Dependency-gated items (full native REALITY, QUIC+Salamander,
+> AmneziaWG, local-RF) are designed with rationale in
+> [`docs/security-and-deferred.md`](docs/security-and-deferred.md) — see *Roadmap*.
 
 Spec-driven via [GitHub Spec Kit](https://github.com/github/spec-kit): the project's iron rules live in
 [`.specify/memory/constitution.md`](.specify/memory/constitution.md); the full design is under
@@ -109,12 +111,15 @@ Fuzz the wire parsers (nightly): `cargo +nightly fuzz run obfs_record` / `messag
 
 ## Roadmap
 
-Implemented: crypto core · obfs-tcp transport · profiles/shaping/rotation · **obfs transport under libp2p
-Noise** (mesh inherits DPI resistance, PSK-gated) · libp2p gossip overlay (gossipsub + private Kademlia +
-AutoNAT/Relay/DCUtR) · signed messages + replay protection · node + CLI · adversarial security review
-applied. **Remaining (designed):** native REALITY & AmneziaWG transports, QUIC+Salamander datapath,
-hybrid-PQ libp2p security upgrade (replace stock Noise), range-based set-reconciliation sync, local-RF
-blackout tier. Tracked in [`specs/001-uber-mesh-core/tasks.md`](specs/001-uber-mesh-core/tasks.md).
+Implemented: crypto core · obfs-tcp transport (probe resistance incl. REALITY-style fallback proxy) ·
+profiles/shaping/rotation · **obfs transport under libp2p Noise** (mesh inherits DPI resistance, PSK-gated) ·
+libp2p gossip overlay (gossipsub + private Kademlia + AutoNAT/Relay/DCUtR) · signed messages + replay
+protection · content exchange (verified blobs by `Cid`) · set reconciliation (negentropy-style) · node + CLI ·
+two adversarial reviews applied. **Resolved by design / dependency-gated** (rationale in
+[`docs/security-and-deferred.md`](docs/security-and-deferred.md)): hybrid-PQ confidentiality is already
+end-to-end via the obfs layer; full native REALITY (uTLS stack), QUIC+Salamander (`quinn` UDP), AmneziaWG
+(WireGuard core), and the local-RF blackout tier (radio hardware) are additive behind the `ObfsTransport`
+seam. Tracked in [`specs/001-uber-mesh-core/tasks.md`](specs/001-uber-mesh-core/tasks.md).
 
 ## License
 

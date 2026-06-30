@@ -32,7 +32,18 @@ constitution Principle V (NON-NEGOTIABLE). Other tasks include tests where they 
 - ✅ **Content exchange (FR-011)** — `ContentStore` + libp2p request-response `/uber-mesh/blobs/1.0.0` with a
   **bincode** codec; `MeshNode::provide`/`request_blob`; receiver verifies `BLAKE3(bytes)==cid`. Integration
   tests (fetch+verify over the obfuscated transport; absent→unavailable). `d35eb69`
+- ✅ **Set reconciliation** — negentropy-style range-based sync (`reconcile` + `/uber-mesh/reconcile/1.0.0`);
+  `MeshNode::start_sync` → `SyncComplete{need, have_extra}`. Pure algorithm + live integration tests. `e0e925a`
+- ✅ **REALITY-style probe resistance** — `ProbeResponse::Fallback` reverse-proxies probers to a real cover
+  site; prober receives genuine content (test). `cb80fa3`
+- ✅ **NAT (T038)** — AutoNAT v2 + Relay v2 + DCUtR wired; client↔relay over obfs tested; reservation/hole-punch
+  deployment-validated. `95a53fc`
 - ✅ **Polish** — fuzz harnesses (`fuzz/`: obfs_record + message_parse), README, supply-chain policy.
+- 📐 **Resolved by design / dependency-gated** (see [`docs/security-and-deferred.md`](../../docs/security-and-deferred.md)):
+  hybrid-PQ confidentiality is **already** end-to-end via the obfs layer (a PQ Noise upgrade adds no
+  harvest-now-decrypt-later protection); full native REALITY (needs a uTLS stack), QUIC+Salamander (needs
+  `quinn` UDP access), AmneziaWG (needs a WireGuard core), and the local-RF blackout tier (needs radio
+  hardware) are designed with rationale and are additive behind the `ObfsTransport` seam — not stubbed/faked.
 - ⏳ **Remaining (designed)** — native REALITY/AmneziaWG transports, QUIC+Salamander datapath, hybrid-PQ libp2p
   security upgrade (replace stock Noise), range-based set-reconciliation sync, local-RF blackout tier, T038 NAT test.
 
