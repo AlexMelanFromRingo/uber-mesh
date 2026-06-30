@@ -13,7 +13,9 @@ pub mod blobs;
 pub mod error;
 pub mod gossip;
 pub mod node;
+pub mod reconcile;
 pub mod store;
+pub mod sync;
 
 pub use behaviour::{MeshBehaviour, build_swarm};
 pub use blobs::{BlobRequest, BlobResponse};

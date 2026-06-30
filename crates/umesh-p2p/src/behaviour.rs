@@ -25,6 +25,7 @@ use umesh_crypto::hash;
 
 use crate::blobs::{BLOB_PROTOCOL, BlobCodec};
 use crate::error::P2pError;
+use crate::sync::{RECONCILE_PROTOCOL, ReconcileCodec};
 
 /// Private Kademlia protocol name.
 pub const KAD_PROTOCOL: StreamProtocol = StreamProtocol::new("/uber-mesh/kad/1.0.0");
@@ -54,6 +55,8 @@ pub struct MeshBehaviour {
     pub dcutr: dcutr::Behaviour,
     /// Content-addressed blob request/response (`/uber-mesh/blobs/1.0.0`, bincode codec).
     pub blobs: request_response::Behaviour<BlobCodec>,
+    /// Range-based set reconciliation (`/uber-mesh/reconcile/1.0.0`, bincode codec).
+    pub reconcile: request_response::Behaviour<ReconcileCodec>,
 }
 
 /// gossipsub message-id = our content-derived [`crate::gossip::SignedMessage::message_id`] when the
@@ -102,6 +105,12 @@ fn build_behaviour(
         request_response::Config::default(),
     );
 
+    let reconcile = request_response::Behaviour::with_codec(
+        ReconcileCodec,
+        [(RECONCILE_PROTOCOL, request_response::ProtocolSupport::Full)],
+        request_response::Config::default(),
+    );
+
     Ok(MeshBehaviour {
         gossipsub,
         kademlia,
@@ -112,6 +121,7 @@ fn build_behaviour(
         relay_client,
         dcutr: dcutr::Behaviour::new(local_peer_id),
         blobs,
+        reconcile,
     })
 }
 

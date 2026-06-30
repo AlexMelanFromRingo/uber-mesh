@@ -15,7 +15,15 @@ use crate::behaviour::{MeshBehaviour, MeshBehaviourEvent};
 use crate::blobs::{BlobRequest, BlobResponse};
 use crate::error::{P2pError, Result};
 use crate::gossip::{self, ReplayGuard, SignedMessage};
+use crate::reconcile::{self, Reconciler};
 use crate::store::ContentStore;
+use crate::sync::ReconcileMsg;
+
+/// In-flight set-reconciliation session with one peer.
+struct SyncSession {
+    rec: Reconciler,
+    local: Vec<[u8; 32]>,
+}
 
 /// Events surfaced to the application from [`MeshNode::next_event`].
 #[derive(Debug)]
@@ -47,6 +55,20 @@ pub enum MeshEvent {
         /// The requested content id.
         cid: Cid,
     },
+    /// Set reconciliation with a peer converged.
+    SyncComplete {
+        /// The peer reconciled with.
+        peer: PeerId,
+        /// Content ids the peer has that we lack (fetch these via `request_blob`).
+        need: Vec<Cid>,
+        /// Content ids we have that the peer lacks (offer/announce these).
+        have_extra: Vec<Cid>,
+    },
+    /// Set reconciliation with a peer failed (connection/transport error).
+    SyncFailed {
+        /// The peer.
+        peer: PeerId,
+    },
 }
 
 /// A running mesh node.
@@ -57,6 +79,8 @@ pub struct MeshNode {
     seqno: u64,
     store: ContentStore,
     pending_blobs: HashMap<OutboundRequestId, Cid>,
+    sync_sessions: HashMap<PeerId, SyncSession>,
+    pending_reconcile: HashMap<OutboundRequestId, PeerId>,
 }
 
 impl MeshNode {
@@ -70,7 +94,29 @@ impl MeshNode {
             seqno: 0,
             store: ContentStore::new(),
             pending_blobs: HashMap::new(),
+            sync_sessions: HashMap::new(),
+            pending_reconcile: HashMap::new(),
         })
+    }
+
+    /// Begin set reconciliation with `peer`: discover which content ids each side is missing. The
+    /// result arrives as a [`MeshEvent::SyncComplete`] (or `SyncFailed`).
+    pub fn start_sync(&mut self, peer: PeerId) {
+        let local = self.store.ids_sorted();
+        let first = reconcile::initiate(&local);
+        let id = self
+            .swarm
+            .behaviour_mut()
+            .reconcile
+            .send_request(&peer, ReconcileMsg(first));
+        self.pending_reconcile.insert(id, peer);
+        self.sync_sessions.insert(
+            peer,
+            SyncSession {
+                rec: Reconciler::default(),
+                local,
+            },
+        );
     }
 
     /// Store content locally and return its `Cid` (this node can now serve it to peers).
@@ -238,6 +284,56 @@ impl MeshNode {
                 )) => {
                     if let Some(cid) = self.pending_blobs.remove(&request_id) {
                         return MeshEvent::BlobUnavailable { cid };
+                    }
+                }
+                SwarmEvent::Behaviour(MeshBehaviourEvent::Reconcile(
+                    request_response::Event::Message { message, .. },
+                )) => match message {
+                    request_response::Message::Request {
+                        request, channel, ..
+                    } => {
+                        // Responder: answer this reconciliation round from our current id set.
+                        let local = self.store.ids_sorted();
+                        let resp = reconcile::respond(&local, &request.0);
+                        let _ = self
+                            .swarm
+                            .behaviour_mut()
+                            .reconcile
+                            .send_response(channel, ReconcileMsg(resp));
+                    }
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                        ..
+                    } => {
+                        if let Some(peer) = self.pending_reconcile.remove(&request_id) {
+                            if let Some(session) = self.sync_sessions.get_mut(&peer) {
+                                let next = session.rec.refine(&session.local, &response.0);
+                                if reconcile::is_converged(&next) {
+                                    let diff = std::mem::take(&mut session.rec.diff);
+                                    self.sync_sessions.remove(&peer);
+                                    return MeshEvent::SyncComplete {
+                                        peer,
+                                        need: diff.need.into_iter().map(Cid).collect(),
+                                        have_extra: diff.have_extra.into_iter().map(Cid).collect(),
+                                    };
+                                }
+                                let id = self
+                                    .swarm
+                                    .behaviour_mut()
+                                    .reconcile
+                                    .send_request(&peer, ReconcileMsg(next));
+                                self.pending_reconcile.insert(id, peer);
+                            }
+                        }
+                    }
+                },
+                SwarmEvent::Behaviour(MeshBehaviourEvent::Reconcile(
+                    request_response::Event::OutboundFailure { request_id, .. },
+                )) => {
+                    if let Some(peer) = self.pending_reconcile.remove(&request_id) {
+                        self.sync_sessions.remove(&peer);
+                        return MeshEvent::SyncFailed { peer };
                     }
                 }
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {

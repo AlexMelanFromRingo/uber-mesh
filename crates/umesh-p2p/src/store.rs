@@ -36,6 +36,13 @@ impl ContentStore {
         self.map.contains_key(cid.as_bytes())
     }
 
+    /// All stored content ids, sorted ascending (for set reconciliation).
+    pub fn ids_sorted(&self) -> Vec<[u8; 32]> {
+        let mut ids: Vec<[u8; 32]> = self.map.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// Number of stored objects.
     pub fn len(&self) -> usize {
         self.map.len()

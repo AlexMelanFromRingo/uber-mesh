@@ -121,6 +121,12 @@ async fn cmd_mesh(
                 MeshEvent::BlobUnavailable { cid } => {
                     println!("blob {cid} unavailable");
                 }
+                MeshEvent::SyncComplete { peer, need, have_extra } => {
+                    println!("sync with {peer}: need {} / can offer {}", need.len(), have_extra.len());
+                }
+                MeshEvent::SyncFailed { peer } => {
+                    println!("sync with {peer} failed");
+                }
             },
             _ = heartbeat.tick() => {
                 let msg = format!("heartbeat from {}", node.app_peer_id());
