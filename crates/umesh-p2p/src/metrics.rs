@@ -147,7 +147,46 @@ pub fn render() -> String {
         HS_SUM_MS.load(Relaxed) as f64 / 1000.0
     ));
     s.push_str(&format!("umesh_handshake_seconds_count {count}\n"));
+
+    process_metrics(&mut s);
     s
+}
+
+/// Per-node resource usage from `/proc/self` (Linux; best-effort, 0 if unavailable).
+fn process_metrics(s: &mut String) {
+    let rss_bytes = std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|c| c.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .map(|pages| pages * 4096)
+        .unwrap_or(0);
+    let open_fds = std::fs::read_dir("/proc/self/fd")
+        .map(|d| d.count() as u64)
+        .unwrap_or(0);
+    let threads = std::fs::read_dir("/proc/self/task")
+        .map(|d| d.count() as u64)
+        .unwrap_or(0);
+    let cpu_secs = std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|c| {
+            // utime (14) + stime (15), in clock ticks (USER_HZ=100); fields after the (comm) paren.
+            let rest = c.rsplit_once(')')?.1;
+            let f: Vec<&str> = rest.split_whitespace().collect();
+            let utime = f.get(11)?.parse::<u64>().ok()?;
+            let stime = f.get(12)?.parse::<u64>().ok()?;
+            Some((utime + stime) as f64 / 100.0)
+        })
+        .unwrap_or(0.0);
+
+    s.push_str("# HELP umesh_process_resident_bytes Resident set size of the node process\n");
+    s.push_str(&format!(
+        "# TYPE umesh_process_resident_bytes gauge\numesh_process_resident_bytes {rss_bytes}\n"
+    ));
+    s.push_str("# TYPE umesh_process_open_fds gauge\n");
+    s.push_str(&format!("umesh_process_open_fds {open_fds}\n"));
+    s.push_str("# TYPE umesh_process_threads gauge\n");
+    s.push_str(&format!("umesh_process_threads {threads}\n"));
+    s.push_str("# TYPE umesh_process_cpu_seconds_total counter\n");
+    s.push_str(&format!("umesh_process_cpu_seconds_total {cpu_secs}\n"));
 }
 
 #[cfg(test)]

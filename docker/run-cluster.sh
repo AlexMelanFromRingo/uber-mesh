@@ -46,4 +46,16 @@ printf "  obfs handshakes (count):        %s\n" "$(q 'sum(umesh_handshake_second
 printf "  obfs handshake p50 (s):         %s\n" "$(q 'histogram_quantile(0.50, sum(umesh_handshake_seconds_bucket) by (le))')"
 printf "  obfs handshake p95 (s):         %s\n" "$(q 'histogram_quantile(0.95, sum(umesh_handshake_seconds_bucket) by (le))')"
 printf "  probe/gate failures:            %s\n" "$(q 'sum(umesh_handshake_failures_total)')"
+
+echo ""
+echo "=== per-node resource usage (Prometheus-scraped from /proc/self) ==="
+printf "  resident MB/node  avg / max:    %s / %s\n" \
+    "$(q 'avg(umesh_process_resident_bytes)/1024/1024')" "$(q 'max(umesh_process_resident_bytes)/1024/1024')"
+printf "  open fds/node     avg / max:    %s / %s\n" \
+    "$(q 'avg(umesh_process_open_fds)')" "$(q 'max(umesh_process_open_fds)')"
+printf "  threads/node      avg / max:    %s / %s\n" \
+    "$(q 'avg(umesh_process_threads)')" "$(q 'max(umesh_process_threads)')"
+printf "  total cluster CPU-seconds:      %s\n" "$(q 'sum(umesh_process_cpu_seconds_total)')"
+echo "  --- docker stats sample (live CPU%/mem, 5 containers) ---"
+docker stats --no-stream --format '    {{.Name}}: cpu={{.CPUPerc}} mem={{.MemUsage}}' $($COMPOSE ps -q | head -5) 2>/dev/null || true
 echo "=== done (tearing down) ==="
