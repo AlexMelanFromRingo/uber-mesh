@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 
 use crate::error::{ObfsError, Result};
-use crate::handshake::{ObfsPsk, client_handshake, server_handshake};
+use crate::handshake::{ObfsPsk, ProbeResponse, client_handshake, server_handshake_probe};
 use crate::secure::SecureStream;
 use crate::shaping::ShapingPolicy;
 
@@ -26,16 +26,27 @@ impl ObfsTcp {
         Ok(SecureStream::new(sock, keys, shaping))
     }
 
-    /// Accept one inbound connection and complete the **probe-resistant** server handshake.
-    /// A connection that fails the gate returns [`ObfsError::AuthFailed`] after silent draining.
+    /// Accept one inbound connection and complete the **probe-resistant** server handshake (silence
+    /// on gate failure). A connection that fails the gate returns [`ObfsError::AuthFailed`].
     pub async fn accept(
         listener: &TcpListener,
         psk: &ObfsPsk,
         shaping: ShapingPolicy,
     ) -> Result<(SecureStream<TcpStream>, SocketAddr)> {
+        Self::accept_with_probe(listener, psk, shaping, &ProbeResponse::Silence).await
+    }
+
+    /// Accept with an explicit probe-response policy (e.g. [`ProbeResponse::Fallback`] to
+    /// reverse-proxy probers to a real cover site — REALITY/ShadowTLS active-probe resistance).
+    pub async fn accept_with_probe(
+        listener: &TcpListener,
+        psk: &ObfsPsk,
+        shaping: ShapingPolicy,
+        probe: &ProbeResponse,
+    ) -> Result<(SecureStream<TcpStream>, SocketAddr)> {
         let (mut sock, peer) = listener.accept().await?;
         let _ = sock.set_nodelay(true);
-        let keys = server_handshake(&mut sock, psk).await?;
+        let keys = server_handshake_probe(&mut sock, psk, probe).await?;
         Ok((SecureStream::new(sock, keys, shaping), peer))
     }
 }

@@ -14,7 +14,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
 use umesh_obfs::wire::{TLS_PREFIX, looks_fully_encrypted};
-use umesh_obfs::{Endpoint, ObfsError, ObfsPsk, ObfsTcp, ShapingPolicy, connect_first_working};
+use umesh_obfs::{
+    Endpoint, ObfsError, ObfsPsk, ObfsTcp, ProbeResponse, ShapingPolicy, connect_first_working,
+    server_handshake_probe,
+};
 
 const FLIGHT1_LEN: usize = 16 + 32 + 1184 + 8 + 16;
 
@@ -136,4 +139,54 @@ async fn rotates_past_dead_endpoint() {
         .await
         .expect("should rotate to the live endpoint");
     s.send(b"via rotation").await.unwrap();
+}
+
+/// 5. REALITY/ShadowTLS-style fallback: a prober that fails the gate is transparently reverse-proxied
+///    to a real cover upstream and receives the upstream's genuine content (active-probe resistance).
+#[tokio::test]
+async fn probe_is_proxied_to_cover_site() {
+    // A "real site" upstream that greets any connection.
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_addr = upstream.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        if let Ok((mut s, _)) = upstream.accept().await {
+            let mut buf = [0u8; 128];
+            let _ = s.read(&mut buf).await; // consume the forwarded probe bytes
+            let _ = s
+                .write_all(b"HTTP/1.1 200 OK\r\n\r\nreal-site-content")
+                .await;
+            let _ = s.flush().await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    });
+
+    // The obfs server, configured to fall back to the cover upstream on gate failure.
+    let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let srv_addr = server.local_addr().unwrap().to_string();
+    let probe_policy = ProbeResponse::Fallback(up_addr);
+    tokio::spawn(async move {
+        if let Ok((mut s, _)) = server.accept().await {
+            let r = server_handshake_probe(&mut s, &ObfsPsk([1u8; 32]), &probe_policy).await;
+            assert!(matches!(r, Err(ObfsError::AuthFailed)));
+        }
+    });
+
+    // A prober sends a flight-shaped junk record (wrong PSK) and should receive the cover content.
+    let mut probe = TcpStream::connect(&srv_addr).await.unwrap();
+    let body = vec![0u8; 1264];
+    let mut rec = vec![TLS_PREFIX[0], TLS_PREFIX[1], TLS_PREFIX[2], 0, 0];
+    rec[3..5].copy_from_slice(&(body.len() as u16).to_be_bytes());
+    rec.extend_from_slice(&body);
+    probe.write_all(&rec).await.unwrap();
+
+    let mut buf = vec![0u8; 128];
+    let n = tokio::time::timeout(Duration::from_secs(5), probe.read(&mut buf))
+        .await
+        .expect("should receive proxied content")
+        .expect("read");
+    let got = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        got.contains("real-site-content"),
+        "prober must receive the cover site's content, got: {got:?}"
+    );
 }

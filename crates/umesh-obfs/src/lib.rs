@@ -23,7 +23,9 @@ pub mod wire;
 
 pub use bytestream::ObfsByteStream;
 pub use error::{ObfsError, Result};
-pub use handshake::{ObfsPsk, SessionKeys, client_handshake, server_handshake};
+pub use handshake::{
+    ObfsPsk, ProbeResponse, SessionKeys, client_handshake, server_handshake, server_handshake_probe,
+};
 pub use profile::{Profile, TransportKind};
 pub use secure::SecureStream;
 pub use shaping::ShapingPolicy;

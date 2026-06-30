@@ -43,6 +43,22 @@ pub async fn read_record<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Read a single TLS-record-framed message, returning the **full raw bytes** (header + body). Used
+/// by the probe-resistant fallback path, which forwards the raw flight verbatim to a cover upstream.
+pub async fn read_record_raw<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>> {
+    let mut hdr = [0u8; HEADER_LEN];
+    r.read_exact(&mut hdr).await?;
+    let len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+    if len > MAX_RECORD {
+        return Err(ObfsError::RecordTooLarge);
+    }
+    let mut raw = Vec::with_capacity(HEADER_LEN + len);
+    raw.extend_from_slice(&hdr);
+    raw.resize(HEADER_LEN + len, 0);
+    r.read_exact(&mut raw[HEADER_LEN..]).await?;
+    Ok(raw)
+}
+
 /// Synchronous, pure parser for one TLS-record-framed message in an in-memory buffer.
 ///
 /// Returns `(payload, bytes_consumed)`, or `None` if the buffer does not yet hold a complete record

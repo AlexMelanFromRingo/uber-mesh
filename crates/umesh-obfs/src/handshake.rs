@@ -14,13 +14,31 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
 use umesh_crypto::aead::{self, AeadKey};
 use umesh_crypto::hash::labels;
 use umesh_crypto::kem;
 
 use crate::error::{ObfsError, Result};
-use crate::wire::{read_record, write_record};
+use crate::wire::{read_record, read_record_raw, write_record};
+
+/// How the server treats a connection that fails the obfs gate (active-probe resistance).
+#[derive(Clone, Debug)]
+pub enum ProbeResponse {
+    /// Drain + randomized delay + close, sending no distinguishing reply (obfs4 model).
+    Silence,
+    /// Reverse-proxy the connection to a real upstream `host:port`, forwarding the bytes already
+    /// received, so a prober transparently talks to a genuine site (REALITY/ShadowTLS model,
+    /// research D3). On `:443` this is stronger than silence — silence is itself anomalous there.
+    Fallback(String),
+}
+
+impl Default for ProbeResponse {
+    fn default() -> Self {
+        ProbeResponse::Silence
+    }
+}
 
 const EPOCH_LEN: usize = 8;
 /// Flight-1 plaintext: x25519_pub(32) || mlkem_ek(1184) || epoch(8).
@@ -131,25 +149,61 @@ where
     })
 }
 
-/// Server side of the handshake. Probe-resistant: a peer whose flight fails the AEAD gate (no PSK,
-/// tampering, or a stale epoch) gets silence + close.
+/// On gate failure, run the configured probe response over `stream`, forwarding any bytes already
+/// read (`prefix`) to a cover upstream for the fallback model.
+async fn handle_probe<S>(stream: &mut S, prefix: &[u8], probe: &ProbeResponse)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match probe {
+        ProbeResponse::Silence => silence(stream).await,
+        ProbeResponse::Fallback(upstream) => match TcpStream::connect(upstream).await {
+            Ok(mut up) => {
+                // Replay the bytes we already consumed, then splice the prober ↔ real site.
+                if up.write_all(prefix).await.is_ok() {
+                    let _ = tokio::io::copy_bidirectional(stream, &mut up).await;
+                }
+            }
+            // Upstream unreachable ⇒ fall back to silence rather than a distinguishing error.
+            Err(_) => silence(stream).await,
+        },
+    }
+}
+
+/// Server side of the handshake, defaulting to silent probe rejection.
 pub async fn server_handshake<S>(stream: &mut S, psk: &ObfsPsk) -> Result<SessionKeys>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    server_handshake_probe(stream, psk, &ProbeResponse::Silence).await
+}
+
+/// Server side of the handshake with an explicit probe-response policy. A peer whose flight fails the
+/// AEAD gate (no PSK, tampering, or a stale epoch) is handled per `probe` (silence or fallback-proxy).
+pub async fn server_handshake_probe<S>(
+    stream: &mut S,
+    psk: &ObfsPsk,
+    probe: &ProbeResponse,
+) -> Result<SessionKeys>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let key = psk.frame_key();
 
-    // Read + open flight 1 under a timeout. Any failure ⇒ treat as a probe (silence).
-    let pt = match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_record(stream)).await {
-        Ok(Ok(wire)) => match aead::open(&key, &wire, HS1_AAD) {
-            Ok(pt) if pt.len() == FLIGHT1_PT_LEN => pt,
-            _ => {
-                silence(stream).await;
-                return Err(ObfsError::AuthFailed);
-            }
-        },
+    // Read the raw first flight under a timeout, keeping the bytes for the fallback path.
+    let raw = match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_record_raw(stream)).await {
+        Ok(Ok(raw)) => raw,
         _ => {
-            silence(stream).await;
+            handle_probe(stream, &[], probe).await;
+            return Err(ObfsError::AuthFailed);
+        }
+    };
+    let body = &raw[crate::wire::HEADER_LEN..];
+
+    let pt = match aead::open(&key, body, HS1_AAD) {
+        Ok(pt) if pt.len() == FLIGHT1_PT_LEN => pt,
+        _ => {
+            handle_probe(stream, &raw, probe).await;
             return Err(ObfsError::AuthFailed);
         }
     };
@@ -162,7 +216,7 @@ where
         .map_err(|_| ObfsError::Malformed)?;
     let client_epoch = u64::from_le_bytes(epoch_bytes);
     if client_epoch.abs_diff(current_epoch()) > 1 {
-        silence(stream).await;
+        handle_probe(stream, &raw, probe).await;
         return Err(ObfsError::AuthFailed);
     }
 
