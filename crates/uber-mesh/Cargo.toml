@@ -16,6 +16,7 @@ path = "src/main.rs"
 umesh-crypto.workspace = true
 umesh-node.workspace = true
 umesh-p2p.workspace = true
+umesh-obfs.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

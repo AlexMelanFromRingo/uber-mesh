@@ -3649,6 +3649,7 @@ dependencies = [
  "tracing-subscriber",
  "umesh-crypto",
  "umesh-node",
+ "umesh-obfs",
  "umesh-p2p",
 ]
 
