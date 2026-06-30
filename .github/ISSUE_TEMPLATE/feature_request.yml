@@ -1,0 +1,35 @@
+name: "✨ Feature request"
+description: Propose an enhancement or a new transport/capability
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        uber-mesh is **spec-driven**. Substantial features start from the constitution and the design
+        under [`specs/`](../../specs/001-uber-mesh-core). Please frame proposals against that context.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What censorship scenario, threat, or limitation does this address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Sketch the design. For a new carrier, note where it sits behind the `ObfsTransport` seam.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Constraints respected
+      options:
+        - label: Keeps the classical crypto half authoritative (hybrid-PQ; no reliance on PQ alone)
+        - label: No new `unsafe` (workspace denies it; crypto crate forbids it)
+        - label: Crypto/protocol/parser code will ship with tests (constitution Principle V)

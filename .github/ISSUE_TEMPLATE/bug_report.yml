@@ -1,0 +1,57 @@
+name: "🐞 Bug report"
+description: Report a defect in uber-mesh (crypto, obfs transport, p2p mesh, node/CLI)
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. **Do not report security vulnerabilities here** — see
+        [SECURITY.md](../../SECURITY.md) and use a private advisory instead.
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: Release tag (e.g. `v0.8.0`) or `git rev-parse --short HEAD`.
+      placeholder: v0.8.0
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - umesh-crypto (KEM / identity / hashing / AEAD)
+        - umesh-obfs (handshake / TLS mimicry / shaping)
+        - umesh-p2p (gossip / kademlia / NAT / blobs / reconcile)
+        - umesh-node / uber-mesh CLI
+        - docs / tooling / CI
+        - not sure
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands. Redact any PSKs / identity seeds.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: OS, architecture, `rustc --version`.
+      placeholder: "Linux x86_64, rustc 1.85.0"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant `RUST_LOG` output. **Never paste secrets.**
+      render: shell
