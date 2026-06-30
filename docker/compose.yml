@@ -1,0 +1,51 @@
+# Real multi-container uber-mesh cluster on an isolated bridge network, each node under tc-netem
+# impairment (latency + jitter + packet loss). Demonstrates the gossip mesh forming and exchanging
+# signed heartbeats over the obfuscated transport despite real network interference.
+#
+#   docker compose -f docker/compose.yml up --build      (or use docker/run-cluster.sh)
+
+x-node: &node
+  image: uber-mesh:bench
+  cap_add: [NET_ADMIN]
+  environment: &env
+    UMESH_PSK: "4242424242424242424242424242424242424242424242424242424242424242"
+    NETEM: "delay 80ms 20ms distribution normal loss 10%"
+    RUST_LOG: "info"
+
+services:
+  boot:
+    <<: *node
+    networks:
+      mesh:
+        ipv4_address: 172.30.0.10
+
+  node1:
+    <<: *node
+    depends_on: [boot]
+    environment:
+      <<: *env
+      BOOTSTRAP: "/ip4/172.30.0.10/tcp/4001"
+    networks: { mesh: {} }
+
+  node2:
+    <<: *node
+    depends_on: [boot]
+    environment:
+      <<: *env
+      BOOTSTRAP: "/ip4/172.30.0.10/tcp/4001"
+    networks: { mesh: {} }
+
+  node3:
+    <<: *node
+    depends_on: [boot]
+    environment:
+      <<: *env
+      BOOTSTRAP: "/ip4/172.30.0.10/tcp/4001"
+    networks: { mesh: {} }
+
+networks:
+  mesh:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
