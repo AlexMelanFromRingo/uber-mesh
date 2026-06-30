@@ -44,6 +44,21 @@ services:
     depends_on: [boot]
     networks: [mesh]
 
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/datasource.yml:/etc/grafana/provisioning/datasources/ds.yml:ro
+      - ./grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/dash.yml:ro
+      - ./grafana/uber-mesh.json:/var/lib/grafana/dashboards/uber-mesh.json:ro
+    depends_on: [prometheus]
+    networks: [mesh]
+
 networks:
   mesh:
     driver: bridge

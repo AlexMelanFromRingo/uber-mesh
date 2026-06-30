@@ -1,0 +1,61 @@
+{
+  "uid": "uber-mesh",
+  "title": "uber-mesh cluster",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Nodes up",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "umesh-prom" },
+      "targets": [{ "expr": "count(umesh_peers_connected)", "refId": "A" }]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Live peer connections",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "umesh-prom" },
+      "targets": [{ "expr": "sum(umesh_peers_connected)", "refId": "A" }]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Obfs handshake p95 (s)",
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "umesh-prom" },
+      "targets": [{ "expr": "histogram_quantile(0.95, sum(umesh_handshake_seconds_bucket) by (le))", "refId": "A" }]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Avg resident MB/node",
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "umesh-prom" },
+      "targets": [{ "expr": "avg(umesh_process_resident_bytes)/1024/1024", "refId": "A" }]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Gossip received rate (msgs/s, cluster)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "umesh-prom" },
+      "targets": [{ "expr": "sum(rate(umesh_gossip_received_total[1m]))", "refId": "A" }]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Gossip rejected (forgeries) + probe failures",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "umesh-prom" },
+      "targets": [
+        { "expr": "sum(umesh_gossip_rejected_total)", "refId": "A" },
+        { "expr": "sum(umesh_handshake_failures_total)", "refId": "B" }
+      ]
+    }
+  ]
+}

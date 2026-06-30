@@ -58,4 +58,12 @@ printf "  threads/node      avg / max:    %s / %s\n" \
 printf "  total cluster CPU-seconds:      %s\n" "$(q 'sum(umesh_process_cpu_seconds_total)')"
 echo "  --- docker stats sample (live CPU%/mem, 5 containers) ---"
 docker stats --no-stream --format '    {{.Name}}: cpu={{.CPUPerc}} mem={{.MemUsage}}' $($COMPOSE ps -q | head -5) 2>/dev/null || true
+echo ""
+echo "=== Grafana pipeline (Prometheus -> Grafana) ==="
+GRAF="http://localhost:3000"
+printf "  grafana health:                 %s\n" "$(curl -s $GRAF/api/health | python3 -c 'import sys,json;print(json.load(sys.stdin).get("database","?"))' 2>/dev/null || echo n/a)"
+printf "  provisioned datasource:         %s\n" "$(curl -s $GRAF/api/datasources | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d[0]["name"] if d else "none")' 2>/dev/null || echo n/a)"
+printf "  provisioned dashboard:          %s\n" "$(curl -s "$GRAF/api/search?query=uber-mesh" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d[0]["title"] if d else "none")' 2>/dev/null || echo n/a)"
+printf "  query via grafana (nodes up):   %s\n" "$(curl -s -G "$GRAF/api/datasources/proxy/uid/umesh-prom/api/v1/query" --data-urlencode 'query=count(umesh_peers_connected)' | python3 -c 'import sys,json;r=json.load(sys.stdin)["data"]["result"];print(r[0]["value"][1] if r else "n/a")' 2>/dev/null || echo n/a)"
+echo "  (Grafana UI: http://localhost:3000 — dashboard 'uber-mesh cluster', anonymous Admin)"
 echo "=== done (tearing down) ==="
