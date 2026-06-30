@@ -149,7 +149,9 @@ async fn main() {
     }
     let real_addrs: Vec<String> = real_addrs.into_iter().map(|a| a.unwrap()).collect();
 
-    // Optionally put a latency middlebox in front of every node's listener.
+    // Optionally put a latency middlebox in front of every node's listener. (NOTE: this delays only
+    // INBOUND traffic per node, so it models a uniform link latency, not per-node geographic RTT —
+    // faithful geo dispersion needs per-container netem on eth0; see docker/compose.geo.yml.)
     let dial_addrs: Vec<String> = if latency.is_zero() {
         real_addrs.clone()
     } else {

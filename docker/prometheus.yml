@@ -7,6 +7,6 @@ scrape_configs:
     # Docker's embedded DNS resolves the compose service names to every replica's IP (A records),
     # so Prometheus discovers all scaled `node` replicas + the bootstrap automatically.
     dns_sd_configs:
-      - names: [boot, node]
+      - names: [boot, node, region_near, region_mid, region_far]
         type: A
         port: 9100

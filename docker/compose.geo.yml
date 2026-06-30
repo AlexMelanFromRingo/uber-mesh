@@ -1,0 +1,78 @@
+# Geo-emulated uber-mesh: three regions with distinct per-container tc-netem delays on eth0, so a
+# node's region latency applies to ALL its traffic (link RTT ≈ regionA.delay + regionB.delay) — the
+# faithful way to emulate geographic dispersion on one host.
+#
+#   docker build -t uber-mesh:bench -f docker/Dockerfile .
+#   docker compose -f docker/compose.geo.yml up -d --scale region_near=6 --scale region_mid=6 --scale region_far=6
+#   # ... query Prometheus (http://localhost:9090) / Grafana (http://localhost:3000) ...
+#   docker compose -f docker/compose.geo.yml down -v
+
+x-env: &env
+  UMESH_PSK: "4242424242424242424242424242424242424242424242424242424242424242"
+  METRICS_PORT: "9100"
+  RUST_LOG: "warn"
+  BOOTSTRAP: "/ip4/172.30.0.10/tcp/4001"
+
+services:
+  boot:
+    image: uber-mesh:bench
+    cap_add: [NET_ADMIN]
+    environment:
+      UMESH_PSK: "4242424242424242424242424242424242424242424242424242424242424242"
+      METRICS_PORT: "9100"
+      RUST_LOG: "warn"
+      NETEM: "delay 15ms 5ms distribution normal"
+    networks:
+      mesh:
+        ipv4_address: 172.30.0.10
+
+  region_near:
+    image: uber-mesh:bench
+    cap_add: [NET_ADMIN]
+    depends_on: [boot]
+    environment: { <<: *env, NETEM: "delay 20ms 5ms distribution normal" }
+    networks: [mesh]
+
+  region_mid:
+    image: uber-mesh:bench
+    cap_add: [NET_ADMIN]
+    depends_on: [boot]
+    environment: { <<: *env, NETEM: "delay 90ms 15ms distribution normal" }
+    networks: [mesh]
+
+  region_far:
+    image: uber-mesh:bench
+    cap_add: [NET_ADMIN]
+    depends_on: [boot]
+    environment: { <<: *env, NETEM: "delay 200ms 25ms distribution normal loss 1%" }
+    networks: [mesh]
+
+  prometheus:
+    image: prom/prometheus:latest
+    command: [--config.file=/etc/prometheus/prometheus.yml, --storage.tsdb.retention.time=1h]
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+    depends_on: [boot]
+    networks: [mesh]
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    ports: ["3000:3000"]
+    volumes:
+      - ./grafana/datasource.yml:/etc/grafana/provisioning/datasources/ds.yml:ro
+      - ./grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/dash.yml:ro
+      - ./grafana/uber-mesh.json:/var/lib/grafana/dashboards/uber-mesh.json:ro
+    depends_on: [prometheus]
+    networks: [mesh]
+
+networks:
+  mesh:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
