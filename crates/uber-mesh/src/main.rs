@@ -46,20 +46,32 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             listen,
             bootstrap,
             psk,
-        } => {
-            // Async runtime only for the long-running command.
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(cmd_run(&dd, profile, listen, bootstrap, psk))
-        }
+        } => build_runtime()?.block_on(cmd_run(&dd, profile, listen, bootstrap, psk)),
         Command::Mesh {
             listen,
             bootstrap,
             topic,
             psk,
-        } => {
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(cmd_mesh(&dd, listen, bootstrap, topic, psk))
-        }
+        } => build_runtime()?.block_on(cmd_mesh(&dd, listen, bootstrap, topic, psk)),
+    }
+}
+
+/// Build the node's Tokio runtime. A mesh node is I/O-bound and mostly idle, so it defaults to a
+/// small worker pool (lighter footprint → more nodes/host, friendlier to mobile/embedded). Override
+/// with `UMESH_WORKERS` (1 = current-thread runtime).
+fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    let workers: usize = std::env::var("UMESH_WORKERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2)
+        .max(1);
+    if workers == 1 {
+        tokio::runtime::Builder::new_current_thread().enable_all().build()
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(workers)
+            .enable_all()
+            .build()
     }
 }
 
