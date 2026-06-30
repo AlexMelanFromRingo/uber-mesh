@@ -29,6 +29,9 @@ constitution Principle V (NON-NEGOTIABLE). Other tasks include tests where they 
 - ✅ **T032 — obfs transport under libp2p Noise** — `ObfsByteStream` (poll-based AsyncRead/Write over the obfs
   AEAD framing) + `with_other_transport` wraps TCP with the PSK-gated obfs handshake under Noise+Yamux. The
   mesh now inherits probe resistance; a wrong-PSK peer cannot connect (integration + cross-process tests). `68e4038`
+- ✅ **Content exchange (FR-011)** — `ContentStore` + libp2p request-response `/uber-mesh/blobs/1.0.0` with a
+  **bincode** codec; `MeshNode::provide`/`request_blob`; receiver verifies `BLAKE3(bytes)==cid`. Integration
+  tests (fetch+verify over the obfuscated transport; absent→unavailable). `d35eb69`
 - ✅ **Polish** — fuzz harnesses (`fuzz/`: obfs_record + message_parse), README, supply-chain policy.
 - ⏳ **Remaining (designed)** — native REALITY/AmneziaWG transports, QUIC+Salamander datapath, hybrid-PQ libp2p
   security upgrade (replace stock Noise), range-based set-reconciliation sync, local-RF blackout tier, T038 NAT test.

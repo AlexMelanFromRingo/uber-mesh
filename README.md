@@ -4,12 +4,13 @@ A decentralized, **censorship-resistant** peer-to-peer mesh network in Rust, bui
 standardized, hybrid post-quantum cryptography. Designed to establish stable, private connectivity even
 under aggressive DPI — Russia's TSPU and Iran's IRGFW — and to degrade gracefully toward blackout.
 
-> **Status: working end-to-end.** Implemented and tested (74 tests, green CI lints): the hybrid-PQ crypto
+> **Status: working end-to-end.** Implemented and tested (80 tests, green CI lints): the hybrid-PQ crypto
 > core, the obfuscated DPI-resilient transport **layered under libp2p Noise** so the whole gossip mesh
 > inherits its probe resistance, the libp2p overlay (gossipsub + private Kademlia + AutoNAT/Relay/DCUtR),
-> signed messages with replay protection, and a runnable CLI (`uber-mesh mesh` joins a real gossip network
-> over the obfuscated carrier; peers with the wrong PSK can't connect). Remaining: native REALITY/AmneziaWG
-> transports, QUIC+Salamander, a hybrid-PQ libp2p security upgrade — see *Roadmap*.
+> signed messages with replay protection, **content exchange** (request/serve verified blobs by `Cid`), and
+> a runnable CLI (`uber-mesh mesh` joins a real gossip network over the obfuscated carrier; peers with the
+> wrong PSK can't connect). Remaining: native REALITY/AmneziaWG transports, QUIC+Salamander, a hybrid-PQ
+> libp2p security upgrade — see *Roadmap*.
 
 Spec-driven via [GitHub Spec Kit](https://github.com/github/spec-kit): the project's iron rules live in
 [`.specify/memory/constitution.md`](.specify/memory/constitution.md); the full design is under
@@ -48,7 +49,7 @@ fully-encrypted classification, active probing, SNI/QUIC inspection, and volumet
 |-------|------|
 | [`umesh-crypto`](crates/umesh-crypto) | Pure-Rust crypto core (no C, `#![forbid(unsafe_code)]`): hybrid X25519+ML-KEM-768 KEM, Ed25519 identity, BLAKE3, XChaCha20-Poly1305, Merkle, PoW. KATs + property tests. |
 | [`umesh-obfs`](crates/umesh-obfs) | Pluggable obfuscated transport: PSK-sealed probe-resistant handshake, AEAD record stream, traffic shaping, environment profiles, `ObfsTcp` + connect-time rotation. DPI-simulation test. |
-| [`umesh-p2p`](crates/umesh-p2p) | libp2p mesh: signed gossip + replay protection, `MeshBehaviour` (gossipsub Strict, private Kademlia, identify, ping) + NAT trio (AutoNAT v2 / Relay v2 / DCUtR), `MeshNode` driver. |
+| [`umesh-p2p`](crates/umesh-p2p) | libp2p mesh: signed gossip + replay protection, `MeshBehaviour` (gossipsub Strict, private Kademlia, identify, ping) + NAT trio (AutoNAT v2 / Relay v2 / DCUtR) + blob request/response (bincode codec), content-addressed `ContentStore`, `MeshNode` driver. |
 | [`umesh-node`](crates/umesh-node) | Node orchestration: config, identity keystore, runtime, secret-free status. |
 | [`uber-mesh`](crates/uber-mesh) | CLI binary. |
 
