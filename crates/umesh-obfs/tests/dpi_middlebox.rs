@@ -133,3 +133,120 @@ async fn raw_encrypted_flow_is_blocked() {
         "raw high-entropy flow must be BLOCKED by the DPI box"
     );
 }
+
+// ── Active-probing censor ────────────────────────────────────────────────────────────────────────
+// A stronger censor: for a flow that passes the entropy filter, it ALSO actively probes the
+// destination (opens its own connection, sends junk) — if the server *responds* like a proxy, block.
+
+async fn active_probe(upstream_port: u16) -> bool {
+    let Ok(mut p) = TcpStream::connect(("127.0.0.1", upstream_port)).await else {
+        return false;
+    };
+    let _ = p.write_all(b"GET / HTTP/1.0\r\n\r\n").await; // unauthenticated junk probe
+    let mut b = [0u8; 16];
+    matches!(
+        tokio::time::timeout(Duration::from_secs(2), p.read(&mut b)).await,
+        Ok(Ok(n)) if n > 0 // a reply ⇒ looks like a proxy/server answering probes
+    )
+}
+
+async fn probing_dpi(
+    upstream_port: u16,
+    allowed: Arc<AtomicUsize>,
+    blocked: Arc<AtomicUsize>,
+) -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut inbound, _)) = l.accept().await else {
+                break;
+            };
+            let (allowed, blocked) = (allowed.clone(), blocked.clone());
+            tokio::spawn(async move {
+                let mut peek = vec![0u8; 64];
+                let n = match tokio::time::timeout(Duration::from_secs(5), inbound.read(&mut peek))
+                    .await
+                {
+                    Ok(Ok(n)) if n > 0 => n,
+                    _ => return,
+                };
+                if looks_fully_encrypted(&peek[..n]) || active_probe(upstream_port).await {
+                    blocked.fetch_add(1, Ordering::SeqCst); // entropy OR active-probe unmasked it
+                    return;
+                }
+                allowed.fetch_add(1, Ordering::SeqCst);
+                if let Ok(mut up) = TcpStream::connect(("127.0.0.1", upstream_port)).await {
+                    let _ = up.write_all(&peek[..n]).await;
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut up).await;
+                }
+            });
+        }
+    });
+    port
+}
+
+async fn spawn_echo_server() -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = l.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut b = [0u8; 256];
+                while let Ok(n) = s.read(&mut b).await {
+                    if n == 0 || s.write_all(&b[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn obfs_survives_active_probing() {
+    let psk = ObfsPsk([5u8; 32]);
+    let upstream = spawn_obfs_echo(psk.clone()).await;
+    let (allowed, blocked) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let box_port = probing_dpi(upstream, allowed.clone(), blocked.clone()).await;
+
+    // The obfs server answers the censor's active probe with SILENCE ⇒ the probe cannot unmask it.
+    let mut c = ObfsTcp::connect(("127.0.0.1", box_port), &psk, ShapingPolicy::aggressive())
+        .await
+        .expect("obfs handshake should survive the active-probing censor");
+    c.send(b"under active probing").await.unwrap();
+    assert_eq!(c.recv().await.unwrap(), b"under active probing");
+    assert!(
+        allowed.load(Ordering::SeqCst) >= 1,
+        "obfs must survive active probing"
+    );
+}
+
+#[tokio::test]
+async fn naive_proxy_is_unmasked_by_active_probing() {
+    // A naive server that answers everything (no probe resistance) is caught by the active probe.
+    let echo = spawn_echo_server().await;
+    let (allowed, blocked) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let box_port = probing_dpi(echo, allowed.clone(), blocked.clone()).await;
+
+    // A low-entropy (TLS-prefixed) flow passes the entropy filter, but the active probe unmasks the
+    // always-answering upstream ⇒ blocked.
+    let mut client = TcpStream::connect(("127.0.0.1", box_port)).await.unwrap();
+    let mut rec = vec![0x17, 0x03, 0x03, 0x00, 0x04, 1, 2, 3, 4]; // TLS-record-shaped, low entropy
+    rec.extend_from_slice(&[0x20; 16]); // printable padding to stay out of the entropy band
+    client.write_all(&rec).await.unwrap();
+    let mut b = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(3), client.read(&mut b))
+        .await
+        .unwrap_or(Ok(0))
+        .unwrap_or(0);
+    assert_eq!(n, 0, "the naive proxy's flow is cut after active probing");
+    assert!(
+        blocked.load(Ordering::SeqCst) >= 1,
+        "active probing must unmask a naive always-answering server"
+    );
+}
