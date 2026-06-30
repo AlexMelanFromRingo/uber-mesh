@@ -24,20 +24,15 @@ use crate::error::{ObfsError, Result};
 use crate::wire::{read_record, read_record_raw, write_record};
 
 /// How the server treats a connection that fails the obfs gate (active-probe resistance).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum ProbeResponse {
     /// Drain + randomized delay + close, sending no distinguishing reply (obfs4 model).
+    #[default]
     Silence,
     /// Reverse-proxy the connection to a real upstream `host:port`, forwarding the bytes already
     /// received, so a prober transparently talks to a genuine site (REALITY/ShadowTLS model,
     /// research D3). On `:443` this is stronger than silence — silence is itself anomalous there.
     Fallback(String),
-}
-
-impl Default for ProbeResponse {
-    fn default() -> Self {
-        ProbeResponse::Silence
-    }
 }
 
 const EPOCH_LEN: usize = 8;
