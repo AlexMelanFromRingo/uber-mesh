@@ -47,6 +47,21 @@ constitution Principle V (NON-NEGOTIABLE). Other tasks include tests where they 
 - ⏳ **Remaining (designed)** — native REALITY/AmneziaWG transports, QUIC+Salamander datapath, hybrid-PQ libp2p
   security upgrade (replace stock Noise), range-based set-reconciliation sync, local-RF blackout tier, T038 NAT test.
 
+## Validation & operations (added 2026-06-30, after review feedback)
+
+Beyond unit/integration tests — real multi-node runs + metrics + impairment (see
+[`docs/benchmarks.md`](../../docs/benchmarks.md)):
+
+- ✅ **In-process N-node benchmark** (`examples/cluster.rs`) — gossip propagation p50/p95/max +
+  delivery ratio under injected link latency. **100 nodes: 396 links, 100% delivery, p50=2ms/p95=3ms.** `b1529ef`,…
+- ✅ **Docker cluster under real `tc netem`** (`docker/`) — isolated containers, real packet loss +
+  latency; mesh forms and signed heartbeats propagate. `005173a`
+- ✅ **Prometheus metrics** — `/metrics` on every node (peers, gossip, blobs, sync, handshake
+  histogram); scalable compose + Prometheus DNS-SD scrape; runner queries aggregate metrics. `34fecf0`,(this change)
+- 🔄 **In progress:** scale Docker to 100 nodes + Prometheus pipeline; DPI-middlebox container
+  (entropy/SNI classifier + active probing) verifying obfs/REALITY-fallback pass it; netem
+  reorder/duplicate/corrupt; chaos/partition + soak.
+
 ## Format: `[ID] [P?] [Story] Description`
 
 - **[P]**: parallelizable (different files, no incomplete-task dependency)

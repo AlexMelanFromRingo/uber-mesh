@@ -1,51 +1,52 @@
-# Real multi-container uber-mesh cluster on an isolated bridge network, each node under tc-netem
-# impairment (latency + jitter + packet loss). Demonstrates the gossip mesh forming and exchanging
-# signed heartbeats over the obfuscated transport despite real network interference.
+# Scalable uber-mesh cluster on an isolated bridge network under tc-netem impairment, with a
+# Prometheus that scrapes every node's /metrics via Docker DNS service discovery.
 #
-#   docker compose -f docker/compose.yml up --build      (or use docker/run-cluster.sh)
+#   NODES=100 bash docker/run-cluster.sh        # 1 bootstrap + 99 scaled nodes + prometheus
+#
+# The `node` service is scaled with `docker compose up --scale node=N`. All replicas dial the
+# bootstrap by its static IP; Prometheus resolves the `node` service name to every replica IP.
 
-x-node: &node
-  image: uber-mesh:bench
-  cap_add: [NET_ADMIN]
-  environment: &env
-    UMESH_PSK: "4242424242424242424242424242424242424242424242424242424242424242"
-    NETEM: "delay 80ms 20ms distribution normal loss 10%"
-    RUST_LOG: "info"
+x-env: &env
+  UMESH_PSK: "4242424242424242424242424242424242424242424242424242424242424242"
+  METRICS_PORT: "9100"
+  RUST_LOG: "warn"
 
 services:
   boot:
-    <<: *node
+    image: uber-mesh:bench
+    cap_add: [NET_ADMIN]
+    environment:
+      <<: *env
+      NETEM: "${NETEM:-delay 50ms 10ms distribution normal loss 2%}"
     networks:
       mesh:
         ipv4_address: 172.30.0.10
 
-  node1:
-    <<: *node
+  node:
+    image: uber-mesh:bench
+    cap_add: [NET_ADMIN]
     depends_on: [boot]
     environment:
       <<: *env
+      NETEM: "${NETEM:-delay 50ms 10ms distribution normal loss 2%}"
       BOOTSTRAP: "/ip4/172.30.0.10/tcp/4001"
-    networks: { mesh: {} }
+    networks: [mesh]
 
-  node2:
-    <<: *node
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=1h
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
     depends_on: [boot]
-    environment:
-      <<: *env
-      BOOTSTRAP: "/ip4/172.30.0.10/tcp/4001"
-    networks: { mesh: {} }
-
-  node3:
-    <<: *node
-    depends_on: [boot]
-    environment:
-      <<: *env
-      BOOTSTRAP: "/ip4/172.30.0.10/tcp/4001"
-    networks: { mesh: {} }
+    networks: [mesh]
 
 networks:
   mesh:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.30.0.0/24
+        - subnet: 172.30.0.0/16

@@ -1,34 +1,41 @@
 #!/usr/bin/env bash
-# Build + run the uber-mesh netem cluster, collect metrics from container logs, tear down.
+# Build + run a scaled uber-mesh cluster (1 bootstrap + N-1 nodes) under tc-netem, with Prometheus
+# scraping every node, then query Prometheus for aggregate metrics, then tear down.
+#
+#   NODES=100 DURATION=90 bash docker/run-cluster.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-DURATION="${DURATION:-50}"
+NODES="${NODES:-100}"
+DURATION="${DURATION:-90}"
+SCALE=$((NODES - 1))
 COMPOSE="docker compose -f docker/compose.yml"
+PROM="http://localhost:9090"
 
 echo "=== building image (prebuilt binary) ==="
 docker build -q -t uber-mesh:bench -f docker/Dockerfile . >/dev/null
 
-echo "=== bringing up 4-node cluster under tc-netem ==="
-$COMPOSE up -d --force-recreate >/dev/null
-trap '$COMPOSE down -v >/dev/null 2>&1 || true' EXIT
+echo "=== bringing up cluster: 1 bootstrap + ${SCALE} nodes + prometheus, under tc-netem ==="
+$COMPOSE up -d --force-recreate --scale node="$SCALE" >/dev/null 2>&1
+trap '$COMPOSE down -v --remove-orphans >/dev/null 2>&1 || true' EXIT
 
-echo "running for ${DURATION}s under impairment (heartbeat interval is 15s)..."
+echo "running for ${DURATION}s (nodes form the mesh; prometheus scrapes every 5s)..."
 sleep "$DURATION"
 
-echo ""
-echo "=== per-node summary (signed heartbeats crossing the impaired mesh) ==="
-total_hb=0
-for svc in boot node1 node2 node3; do
-    logs=$($COMPOSE logs "$svc" 2>/dev/null || true)
-    conns=$(printf '%s' "$logs" | grep -c "peer connected" || true)
-    hbs=$(printf '%s' "$logs" | grep -c "uber-mesh/global" || true)
-    netem=$(printf '%s' "$logs" | grep -o "netem on .*" | head -1 || true)
-    printf "  %-6s peer_connections=%-2s heartbeats_received=%-2s | %s\n" "$svc" "$conns" "$hbs" "$netem"
-    total_hb=$((total_hb + hbs))
-done
-echo "  ---- total signed heartbeats delivered across the cluster: $total_hb"
+# Query Prometheus instant vectors via its HTTP API.
+q() { curl -sG "$PROM/api/v1/query" --data-urlencode "query=$1" \
+        | python3 -c "import sys,json; r=json.load(sys.stdin).get('data',{}).get('result',[]); print(r[0]['value'][1] if r else 'n/a')" 2>/dev/null || echo "n/a"; }
 
 echo ""
-echo "=== sample delivered heartbeats (sender authenticated by app PeerId b3:...) ==="
-$COMPOSE logs 2>/dev/null | grep "uber-mesh/global" | tail -4 || true
+echo "=== Prometheus-scraped cluster metrics (${NODES} nodes under impairment) ==="
+printf "  nodes scraped (up targets):     %s\n" "$(q 'count(umesh_peers_connected)')"
+printf "  total live peer connections:    %s\n" "$(q 'sum(umesh_peers_connected)')"
+printf "  total peer connections (cum):   %s\n" "$(q 'sum(umesh_peers_total)')"
+printf "  total gossip msgs received:     %s\n" "$(q 'sum(umesh_gossip_received_total)')"
+printf "  total gossip msgs published:    %s\n" "$(q 'sum(umesh_gossip_published_total)')"
+printf "  gossip msgs rejected (forgery):  %s\n" "$(q 'sum(umesh_gossip_rejected_total)')"
+printf "  obfs handshakes (count):        %s\n" "$(q 'sum(umesh_handshake_seconds_count)')"
+printf "  obfs handshake p50 (s):         %s\n" "$(q 'histogram_quantile(0.50, sum(umesh_handshake_seconds_bucket) by (le))')"
+printf "  obfs handshake p95 (s):         %s\n" "$(q 'histogram_quantile(0.95, sum(umesh_handshake_seconds_bucket) by (le))')"
+printf "  probe/gate failures:            %s\n" "$(q 'sum(umesh_handshake_failures_total)')"
+echo "=== done (tearing down) ==="
