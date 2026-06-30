@@ -5,7 +5,19 @@
 version = 2
 # Fail the build on any security advisory or unmaintained/yanked crate.
 yanked = "deny"
-ignore = []
+# Documented, reviewed exceptions only (constitution Principle VII — we acknowledge these, not hide them):
+ignore = [
+    # bincode is flagged "unmaintained". We deliberately depend on the 2.x line: bincode 3.0.0 is a
+    # protest/troll release that refuses to compile, and 2.x is the real, maintained-as-of-pin API.
+    # No known vulnerability; revisit if a maintained successor appears. (docs/security-and-deferred.md)
+    "RUSTSEC-2025-0141",
+    # `paste` (proc-macro) is unmaintained but is a transitive dep pulled by the crypto stack, has no
+    # known vulnerability, and runs only at compile time. No drop-in replacement is pulled by our deps.
+    "RUSTSEC-2024-0436",
+    # Unsound `IterMut` (Stacked-Borrows violation) in a transitive dependency. Not reachable through
+    # our usage; tracked upstream. No fixed release is available in the current dependency tree.
+    "RUSTSEC-2026-0002",
+]
 
 [licenses]
 version = 2

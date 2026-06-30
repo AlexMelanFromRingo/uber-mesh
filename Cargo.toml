@@ -60,11 +60,11 @@ anyhow = "1"
 # --- dev / test ---
 proptest = "1"
 
-# internal crates
-umesh-crypto = { path = "crates/umesh-crypto" }
-umesh-obfs = { path = "crates/umesh-obfs" }
-umesh-p2p = { path = "crates/umesh-p2p" }
-umesh-node = { path = "crates/umesh-node" }
+# internal crates (version pins the path dep so it is not a wildcard — cargo-deny `bans.wildcards`)
+umesh-crypto = { path = "crates/umesh-crypto", version = "0.1.0" }
+umesh-obfs = { path = "crates/umesh-obfs", version = "0.1.0" }
+umesh-p2p = { path = "crates/umesh-p2p", version = "0.1.0" }
+umesh-node = { path = "crates/umesh-node", version = "0.1.0" }
 
 [profile.release]
 lto = "thin"

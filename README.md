@@ -43,7 +43,7 @@ blocks, and verify every message end-to-end without any central authority.
 
 ## Highlights
 
-| | |
+| Capability | What it does |
 |---|---|
 | 🔐 **Hybrid post-quantum** | Every link is keyed by **X25519 + ML-KEM-768** via an X-Wing-style BLAKE3 combiner. Classical half stays authoritative; all mesh data rides a PQ-keyed tunnel (no harvest-now-decrypt-later). |
 | 🥷 **TLS-1.3-ClientHello mimicry** | The obfs handshake is a *structurally-valid* TLS 1.3 ClientHello → ServerHello with a PQ-hybrid `X25519MLKEM768` key_share. Defeats entropy/no-header **and** TLS-state-machine DPI; blends with real PQ-TLS. |

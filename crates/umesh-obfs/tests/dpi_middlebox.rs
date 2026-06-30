@@ -312,7 +312,11 @@ async fn obfs_passes_tls_state_machine_dpi() {
         allowed.load(Ordering::SeqCst) >= 1,
         "obfs flow must be ALLOWED by the TLS-state-machine box"
     );
-    assert_eq!(blocked.load(Ordering::SeqCst), 0, "obfs flow must not be blocked");
+    assert_eq!(
+        blocked.load(Ordering::SeqCst),
+        0,
+        "obfs flow must not be blocked"
+    );
 }
 
 #[tokio::test]
@@ -336,8 +340,15 @@ async fn appdata_first_flow_is_blocked_by_state_machine() {
         .await
         .unwrap_or(Ok(0))
         .unwrap_or(0);
-    assert_eq!(n, 0, "an app-data-first flow is cut by the state-machine censor");
-    assert_eq!(allowed.load(Ordering::SeqCst), 0, "app-data-first flow must not be allowed");
+    assert_eq!(
+        n, 0,
+        "an app-data-first flow is cut by the state-machine censor"
+    );
+    assert_eq!(
+        allowed.load(Ordering::SeqCst),
+        0,
+        "app-data-first flow must not be allowed"
+    );
     assert!(
         blocked.load(Ordering::SeqCst) >= 1,
         "an app-data-first flow must be BLOCKED by the TLS-state-machine box"

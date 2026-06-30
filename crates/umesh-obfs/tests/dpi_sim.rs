@@ -109,7 +109,10 @@ async fn first_flight_is_a_client_hello() {
     let first = captured.lock().await.clone();
     assert!(first.len() >= 5);
     // Opens with a TLS *handshake* record (0x16), not application-data.
-    assert_eq!(first[0], 0x16, "first flight must be a TLS handshake record");
+    assert_eq!(
+        first[0], 0x16,
+        "first flight must be a TLS handshake record"
+    );
     assert!(is_tls_record_header(&first));
     assert!(
         !looks_fully_encrypted(&first),

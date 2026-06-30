@@ -66,7 +66,9 @@ fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
         .unwrap_or(2)
         .max(1);
     if workers == 1 {
-        tokio::runtime::Builder::new_current_thread().enable_all().build()
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
     } else {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(workers)
