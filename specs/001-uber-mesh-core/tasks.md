@@ -63,7 +63,15 @@ Beyond unit/integration tests — real multi-node runs + metrics + impairment (s
 - ✅ **DPI middlebox** — entropy-classifier censor in the path: obfs PASSES, raw high-entropy flow
   BLOCKED (`tests/dpi_middlebox.rs`). `05b292c`
 - ✅ **Heavy netem + chaos** — loss/reorder/duplicate/corrupt + killing 12/50 nodes mid-run; survivors
-  keep gossiping (3,741 msgs). Honest caveats (geo, real-DPI, soak) in `docs/benchmarks.md`.
+  keep gossiping (3,741 msgs).
+- ✅ **DPI active-probing** — censor probes suspects; obfs silence survives, naive proxy unmasked. `tests/dpi_middlebox.rs`
+- ✅ **Per-node resources** — `umesh_process_*` metrics: RSS ~4MB leaf/~33MB boot, near-idle CPU, ~14 threads.
+- ✅ **Throughput** — 267 MB/s (no shaping); aggressive IAT jitter caps bulk to 1.4 MB/s (by design).
+- ✅ **Grafana pipeline** — provisioned datasource + dashboard, verified via API (`docker/grafana/`).
+- ✅ **Geo-emulation** — 3 regions × per-container netem on eth0 (`docker/compose.geo.yml`); handshake p95 reflects far region.
+- ✅ **Soak (3 min)** — RSS stable, no leak.
+- 🚫 **Cannot close here (won't fake):** real nation-state/in-country DPI, true geo across real
+  datacenters, hours/days soak, Grafana visual. See `docs/benchmarks.md` caveats.
 
 ## Format: `[ID] [P?] [Story] Description`
 

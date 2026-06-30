@@ -1,85 +1,94 @@
-# uber-mesh — multi-node validation, metrics & impairment
+# uber-mesh — multi-node validation, metrics, impairment & throughput
 
-Harnesses that exercise the **real code** beyond unit/integration tests: an in-process N-node
-benchmark, a scalable Docker cluster under real `tc netem` with a Prometheus pipeline, and a DPI
-middlebox that genuinely censors. Numbers measured on this machine (12 cores / 27 GiB, mid-2026).
+Harnesses exercising the **real code** beyond unit/integration tests. Numbers measured on this machine
+(12 cores / 27 GiB, mid-2026). Each result is reproducible via the commands shown.
 
-## 1. In-process N-node benchmark — `cargo run --release --example cluster`
+## 1. In-process N-node gossip benchmark — `cargo run --release --example cluster`
 
-N real `MeshNode`s (real libp2p + obfuscated transport over loopback TCP), star+ring topology,
-gossip one message from node 0 to the other N−1, optionally through a latency middlebox.
-
-| Nodes | Link latency | Peer connections | Delivery | Propagation p50 / p95 / max |
+| Nodes | Link latency | Peer conns | Delivery | Propagation p50 / p95 / max |
 |---|---|---|---|---|
 | 20 | 0 ms | 76 | 100% | 0 / 1 / 1 ms |
 | 20 | +30 ms | 76 | 100% | 31 / 31 / 31 ms |
 | 20 | +150 ms | 76 | 100% | 151 / 152 / 152 ms |
-| **100** | 0 ms | **396** | **100%** | **2 / 3 / 4 ms** |
+| **100** | 0 ms | 396 | **100%** | 2 / 3 / 4 ms |
 
-## 2. Docker cluster + Prometheus — `NODES=100 bash docker/run-cluster.sh`
+(The in-process latency middlebox delays inbound only — a uniform-link model, not geo; see §7.)
 
-Isolated bridge network: 1 bootstrap (static IP) + N−1 scaled `node` replicas + Prometheus
-(DNS-SD scrape of every node's `/metrics`). Each node runs `uber-mesh mesh` over the obfuscated
-transport under `tc netem`; the runner queries Prometheus for cluster aggregates.
+## 2. Docker cluster + Prometheus + per-node resources — `NODES=100 bash docker/run-cluster.sh`
 
-**100 nodes, `netem: delay 50ms 10ms loss 2%`:**
+1 bootstrap + N−1 scaled `node` replicas + Prometheus (DNS-SD scrape of every `/metrics`) under
+`tc netem`. **100 nodes, `delay 50ms 10ms loss 2%`:**
 
-| Metric (Prometheus, cluster-wide) | Value |
+| Metric (cluster-wide, via Prometheus) | Value |
 |---|---|
-| nodes scraped (up targets) | **100 / 100** |
+| nodes scraped | **100 / 100** |
 | live peer connections | 198 |
-| gossip messages received | **25 540** |
-| gossip messages published | 562 |
+| gossip messages received | 25 540 |
 | gossip rejected (forgery) | 0 |
-| obfs handshakes | 198 |
-| **obfs handshake p50 / p95** | **57 ms / 147 ms** |
-| probe/gate failures | 0 |
+| **obfs handshake p50 / p95** | **57 ms / 147 ms** (under the 150 ms SC target) |
 
-The obfs-handshake **p95 = 147 ms is under the spec's ≤150 ms target** (SC), measured over 198 real
-handshakes through the obfuscated carrier under impairment.
-
-Every node exposes Prometheus metrics: `umesh_peers_connected`, `umesh_gossip_{received,published,
-rejected}_total`, `umesh_blobs_{served,received}_total`, `umesh_sync_completed_total`,
-`umesh_handshake_failures_total`, and the `umesh_handshake_seconds` histogram.
+**Per-node resources** (`umesh_process_*` from `/proc/self`, 40-node run): RSS **~4 MB leaf / ~33 MB
+bootstrap** (`docker stats`), CPU **near-idle** (2.96 CPU-s / 50 s for 40 nodes; leaf 0.01–0.1%), ~14
+threads, ~16 fds/node. Lightweight.
 
 ## 3. Heavy impairment + chaos — `NODES=50 CHAOS=12 NETEM="…" bash docker/run-cluster.sh`
 
-**50 nodes, `delay 60ms 15ms loss 3% reorder 20% 50% duplicate 1% corrupt 0.1%`, killing 12 nodes
-mid-run:**
-
-| Metric | Value |
-|---|---|
-| nodes scraped after chaos | 38 (= 50 − 12 killed) |
-| live peer connections (survivors) | 74 |
-| gossip messages received | **3 741** |
-| gossip rejected | 0 |
-| obfs handshake p50 / p95 | 60 ms / 642 ms |
-
-The mesh **survives node churn + packet loss/reorder/duplication/corruption** and keeps gossiping
-among survivors. Handshake p95 degrades to 642 ms under bit-corruption (honest: corruption forces TCP
-retransmits + AEAD-failure retries) — handshakes still complete.
+`delay 60ms 15ms loss 3% reorder 20% 50% duplicate 1% corrupt 0.1%`, killing 12/50 nodes mid-run:
+**38 survivors keep gossiping (3 741 msgs), 0 forgeries.** Handshake p95 degrades to 642 ms under
+bit-corruption (TCP retransmits + AEAD retries) — handshakes still complete.
 
 ## 4. DPI middlebox — `cargo test -p umesh-obfs --test dpi_middlebox`
 
-A censor box in the connection path applies the USENIX'23 fully-encrypted heuristic
-(`umesh_obfs::wire::looks_fully_encrypted`: no recognizable header + high popcount → DROP). Verified:
+A censor in the connection path. Verified:
 
-- ✅ the **obfs transport passes** — its TLS-record-framed first flight is exempt; the handshake +
-  data exchange complete *through* the censor.
-- ✅ a **raw high-entropy flow is blocked** — proving the box genuinely censors, so the pass is real.
+- ✅ **Entropy/no-header filter** (USENIX'23 fully-encrypted heuristic): obfs **passes** (TLS-record
+  framing exempt; handshake + data complete through the censor); a **raw high-entropy flow is blocked**.
+- ✅ **Active probing**: the censor probes suspect servers — obfs answers with **silence** → not
+  unmasked → allowed; a naive always-answering proxy **is unmasked** → blocked.
+
+## 5. Throughput (saturation) — `cargo run --release --example throughput`
+
+Obfuscated transport (hybrid-PQ keyed, XChaCha20-Poly1305 records, loopback):
+
+| Mode | Goodput |
+|---|---|
+| no shaping | **267 MB/s** (34k msgs/s) |
+| light shaping | 289 MB/s |
+| aggressive (IAT jitter) | **1.4 MB/s** — per-record timing jitter caps bulk *by design* (covert rate); should be per-burst for bulk |
+
+## 6. Metrics pipeline — Prometheus → Grafana
+
+Every node serves `/metrics`; Prometheus scrapes via DNS-SD; Grafana auto-provisions a datasource +
+`uber-mesh cluster` dashboard. `run-cluster.sh` verifies: grafana health `ok`, datasource `Prometheus`,
+dashboard loaded, and a query **through Grafana's proxy** returned the live node count. UIs at
+`:9090` (Prometheus) and `:3000` (Grafana).
+
+## 7. Geo-emulation — `docker compose -f docker/compose.geo.yml up --scale region_*=…`
+
+Three regions with distinct per-container `netem` on `eth0` (near 20 ms / mid 90 ms / far 200 ms+1% loss)
+so each node's latency applies to **all** its traffic (link RTT ≈ sum of endpoints' delays — the faithful
+model). 3×7 nodes: **22 up, 1 754 gossip msgs across regions, 0 forgeries**, obfs handshake p95 = 487 ms
+(reflecting the far region's 200 ms links; well under the 10 s handshake timeout).
+
+## 8. Soak — `NODES=20 DURATION=180 bash docker/run-cluster.sh`
+
+20 nodes for 3 minutes: all 20 up throughout, 4 192 gossip msgs, **RSS stable ~12 MB avg / 24 MB max
+(no leak)**, threads flat at 14, handshake p95 = 147 ms, 0 forgeries.
 
 ## Caveats — honest scope
 
-- ✅ Now done: **100 nodes** (in-process + Docker), **Prometheus metrics pipeline**, **real `tc netem`**
-  (loss/latency/reorder/duplicate/corrupt), **chaos/partition** (node kills), a **DPI middlebox** that
-  cuts by entropy and which the obfuscation passes, and the **SC handshake p95 ≤ 150 ms** target met
-  under normal impairment.
-- ❌ The DPI middlebox uses the same entropy heuristic the obfs is *designed* to defeat; it is a
-  faithful model of the primary modern censor, **not** a nation-state DPI with active probing at scale,
-  ML classifiers, or TLS-state-machine analysis. Real in-country (Iran/Russia) survivability is still
-  unproven and can only be measured in the field.
-- ❌ **Single host, one bridge network** — not geographically distributed; netem approximates RTT but
-  not real internet paths/CGNAT/asymmetry. Star topology (all dial one bootstrap).
-- ❌ No long **soak** (minutes, not hours/days); throughput is observed via message counts, not a
-  saturating throughput benchmark; no Grafana dashboards (Prometheus only).
-- ❌ `corrupt`/`reorder` degrade handshake p95 (642 ms) — acceptable but unoptimized.
+**Closed by the above:** 100 nodes (in-process + Docker), Prometheus **+ Grafana** pipeline, per-node
+resource metrics, real `tc netem` (loss/latency/reorder/duplicate/corrupt), chaos/partition, an
+entropy **+ active-probing** DPI middlebox the obfs passes, saturation throughput, geo-emulation (faithful
+per-region RTT), and a multi-minute soak with no leak. Handshake p95 ≤ 150 ms (SC) met under normal netem.
+
+**Still NOT closed — fundamentally out of reach here (will not fake):**
+- **Real nation-state DPI / in-country (Iran/Russia) survivability** — needs access to those networks;
+  the middlebox is a faithful model of the primary heuristic, not a real censor with ML classifiers or
+  TLS-state-machine analysis at scale.
+- **Note:** the obfs first flight is a TLS *Application-Data* record, not a real ClientHello — a strict
+  TLS-state-machine DPI ("handshake must precede app-data") would flag it. Full ClientHello mimicry =
+  the deferred native-REALITY work (`docs/security-and-deferred.md`).
+- **True geographic distribution** across real datacenters/CGNAT/asymmetric paths — emulated via netem on
+  a single host, not real.
+- **Long soak** (hours/days) and **Grafana visual** validation (verified via API, not a rendered screen).

@@ -180,10 +180,10 @@ async fn main() {
     let warmup = Duration::from_secs(6);
     let warm_deadline = Instant::now() + warmup;
     while Instant::now() < warm_deadline {
-        if let Ok(Some(m)) = tokio::time::timeout(Duration::from_millis(200), evt_rx.recv()).await {
-            if let Metric::Connected = m {
-                connections += 1;
-            }
+        if let Ok(Some(Metric::Connected)) =
+            tokio::time::timeout(Duration::from_millis(200), evt_rx.recv()).await
+        {
+            connections += 1;
         }
     }
     println!(
