@@ -16,13 +16,14 @@ use libp2p::kad::store::MemoryStore;
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::{
     StreamProtocol, Swarm, SwarmBuilder, autonat, dcutr, gossipsub, identify, identity, kad, noise,
-    ping, relay, tcp, yamux,
+    ping, relay, request_response, tcp, yamux,
 };
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use umesh_obfs::{ObfsByteStream, ObfsPsk, client_handshake, server_handshake};
 
 use umesh_crypto::hash;
 
+use crate::blobs::{BLOB_PROTOCOL, BlobCodec};
 use crate::error::P2pError;
 
 /// Private Kademlia protocol name.
@@ -51,6 +52,8 @@ pub struct MeshBehaviour {
     pub relay_client: relay::client::Behaviour,
     /// Direct Connection Upgrade through Relay (coordinated hole punching).
     pub dcutr: dcutr::Behaviour,
+    /// Content-addressed blob request/response (`/uber-mesh/blobs/1.0.0`, bincode codec).
+    pub blobs: request_response::Behaviour<BlobCodec>,
 }
 
 /// gossipsub message-id = our content-derived [`crate::gossip::SignedMessage::message_id`] when the
@@ -93,6 +96,12 @@ fn build_behaviour(
             .with_agent_version(AGENT_VERSION.to_string()),
     );
 
+    let blobs = request_response::Behaviour::with_codec(
+        BlobCodec,
+        [(BLOB_PROTOCOL, request_response::ProtocolSupport::Full)],
+        request_response::Config::default(),
+    );
+
     Ok(MeshBehaviour {
         gossipsub,
         kademlia,
@@ -102,6 +111,7 @@ fn build_behaviour(
         relay: relay::Behaviour::new(local_peer_id, relay::Config::default()),
         relay_client,
         dcutr: dcutr::Behaviour::new(local_peer_id),
+        blobs,
     })
 }
 

@@ -11,8 +11,10 @@ description = "libp2p mesh behaviour for uber-mesh (signed gossip, discovery, NA
 umesh-crypto.workspace = true
 umesh-obfs.workspace = true
 thiserror.workspace = true
+async-trait.workspace = true
 tracing.workspace = true
 lru.workspace = true
+bincode.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 futures.workspace = true
@@ -29,6 +31,7 @@ libp2p = { version = "0.56", features = [
     "autonat",
     "relay",
     "dcutr",
+    "request-response",
 ] }
 
 [dev-dependencies]

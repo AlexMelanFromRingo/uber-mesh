@@ -1,15 +1,21 @@
 //! High-level mesh node: drives the swarm, publishes signed messages, validates inbound messages
 //! before gossipsub re-propagates them.
 
+use std::collections::HashMap;
+
 use futures::StreamExt;
+use libp2p::request_response::{self, OutboundRequestId};
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId, Swarm, gossipsub};
+use umesh_crypto::hash::Cid;
 use umesh_crypto::identity::NodeIdentity;
 use umesh_obfs::ObfsPsk;
 
 use crate::behaviour::{MeshBehaviour, MeshBehaviourEvent};
+use crate::blobs::{BlobRequest, BlobResponse};
 use crate::error::{P2pError, Result};
 use crate::gossip::{self, ReplayGuard, SignedMessage};
+use crate::store::ContentStore;
 
 /// Events surfaced to the application from [`MeshNode::next_event`].
 #[derive(Debug)]
@@ -29,6 +35,18 @@ pub enum MeshEvent {
     PeerDisconnected(PeerId),
     /// The node started listening on a new address.
     Listening(Multiaddr),
+    /// A requested blob arrived and was verified against its `Cid`.
+    BlobReceived {
+        /// Content id (verified: `BLAKE3(data) == cid`).
+        cid: Cid,
+        /// The verified content bytes.
+        data: Vec<u8>,
+    },
+    /// A requested blob was unavailable (peer didn't have it, or it failed verification).
+    BlobUnavailable {
+        /// The requested content id.
+        cid: Cid,
+    },
 }
 
 /// A running mesh node.
@@ -37,6 +55,8 @@ pub struct MeshNode {
     identity: NodeIdentity,
     guard: ReplayGuard,
     seqno: u64,
+    store: ContentStore,
+    pending_blobs: HashMap<OutboundRequestId, Cid>,
 }
 
 impl MeshNode {
@@ -48,7 +68,27 @@ impl MeshNode {
             identity: NodeIdentity::from_seed(seed),
             guard: ReplayGuard::default(),
             seqno: 0,
+            store: ContentStore::new(),
+            pending_blobs: HashMap::new(),
         })
+    }
+
+    /// Store content locally and return its `Cid` (this node can now serve it to peers).
+    pub fn provide(&mut self, data: Vec<u8>) -> Cid {
+        self.store.put(data)
+    }
+
+    /// Request a blob by `Cid` from a specific peer. The result arrives as a [`MeshEvent`]
+    /// (`BlobReceived` once verified, or `BlobUnavailable`).
+    pub fn request_blob(&mut self, peer: PeerId, cid: Cid) -> OutboundRequestId {
+        let id = self.swarm.behaviour_mut().blobs.send_request(
+            &peer,
+            BlobRequest {
+                cid: *cid.as_bytes(),
+            },
+        );
+        self.pending_blobs.insert(id, cid);
+        id
     }
 
     /// libp2p transport PeerId (multihash of the public key).
@@ -159,6 +199,45 @@ impl MeshNode {
                                     gossipsub::MessageAcceptance::Reject,
                                 );
                         }
+                    }
+                }
+                SwarmEvent::Behaviour(MeshBehaviourEvent::Blobs(
+                    request_response::Event::Message { message, .. },
+                )) => match message {
+                    request_response::Message::Request {
+                        request, channel, ..
+                    } => {
+                        // Serve the blob from our store if we hold it.
+                        let cid = Cid(request.cid);
+                        let data = self.store.get(&cid).map(|b| b.to_vec());
+                        let _ = self
+                            .swarm
+                            .behaviour_mut()
+                            .blobs
+                            .send_response(channel, BlobResponse { data });
+                    }
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                        ..
+                    } => {
+                        if let Some(cid) = self.pending_blobs.remove(&request_id) {
+                            match response.data {
+                                // Verify BLAKE3(bytes) == cid before trusting the content (FR-011).
+                                Some(data) if cid.verifies(&data) => {
+                                    self.store.put(data.clone());
+                                    return MeshEvent::BlobReceived { cid, data };
+                                }
+                                _ => return MeshEvent::BlobUnavailable { cid },
+                            }
+                        }
+                    }
+                },
+                SwarmEvent::Behaviour(MeshBehaviourEvent::Blobs(
+                    request_response::Event::OutboundFailure { request_id, .. },
+                )) => {
+                    if let Some(cid) = self.pending_blobs.remove(&request_id) {
+                        return MeshEvent::BlobUnavailable { cid };
                     }
                 }
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {

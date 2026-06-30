@@ -9,11 +9,15 @@
 //! steps — see `specs/001-uber-mesh-core/contracts/libp2p-protocols.md`.
 
 pub mod behaviour;
+pub mod blobs;
 pub mod error;
 pub mod gossip;
 pub mod node;
+pub mod store;
 
 pub use behaviour::{MeshBehaviour, build_swarm};
+pub use blobs::{BlobRequest, BlobResponse};
 pub use error::{P2pError, Result};
 pub use gossip::{MsgError, ReplayGuard, SignedMessage, validate};
 pub use node::{MeshEvent, MeshNode};
+pub use store::ContentStore;

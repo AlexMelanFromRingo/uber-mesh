@@ -115,6 +115,12 @@ async fn cmd_mesh(
                 MeshEvent::Message { topic, sender, payload } => {
                     println!("[{topic}] {sender}: {}", String::from_utf8_lossy(&payload));
                 }
+                MeshEvent::BlobReceived { cid, data } => {
+                    println!("blob {cid} received ({} bytes, verified)", data.len());
+                }
+                MeshEvent::BlobUnavailable { cid } => {
+                    println!("blob {cid} unavailable");
+                }
             },
             _ = heartbeat.tick() => {
                 let msg = format!("heartbeat from {}", node.app_peer_id());

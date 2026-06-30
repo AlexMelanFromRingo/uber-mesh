@@ -36,12 +36,16 @@ chacha20poly1305 = { version = "0.11", features = ["alloc"] }
 rs_merkle = "1.5"
 rand = "0.8"
 lru = "0.12"
+# NB: bincode 3.0.0 is a protest/troll release that refuses to compile (compile_error!); 2.x is the
+# real, maintained line with the same Encode/Decode derive + encode_to_vec/decode_from_slice API.
+bincode = "2"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 subtle = "2"
 hex = "0.4"
 
 # --- shared infra ---
 thiserror = "2"
+async-trait = "0.1"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "macros", "sync", "signal"] }
