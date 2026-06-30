@@ -89,11 +89,19 @@ pub fn popcount_per_byte(data: &[u8]) -> f64 {
     bits as f64 / data.len() as f64
 }
 
+/// True if `opening` begins with a recognizable TLS record header: a known `content_type`
+/// (ChangeCipherSpec/Alert/Handshake/ApplicationData) followed by a TLS major version `0x03`. This
+/// covers both our ClientHello first flight (`0x16`) and the data records (`0x17`).
+pub fn is_tls_record_header(opening: &[u8]) -> bool {
+    opening.len() >= 3 && matches!(opening[0], 0x14..=0x17) && opening[1] == 0x03
+}
+
 /// A minimal model of a censor's "fully-encrypted" classifier (USENIX'23 Ex1+Ex2): a flow is flagged
 /// when its opening bytes have **no recognizable protocol header** AND a high average popcount.
-/// uber-mesh's TLS-record prefix makes this return `false` for our first flight.
+/// uber-mesh's TLS-record header (handshake `0x16` first flight, then `0x17` data) makes this return
+/// `false`.
 pub fn looks_fully_encrypted(opening: &[u8]) -> bool {
-    if opening.len() >= 3 && opening[..3] == TLS_PREFIX {
+    if is_tls_record_header(opening) {
         return false; // recognizable header ⇒ exempt
     }
     let pc = popcount_per_byte(opening);
@@ -131,10 +139,15 @@ mod tests {
 
     #[test]
     fn classifier_exempts_tls_prefixed_flow() {
-        // High-entropy body, but TLS-prefixed ⇒ not flagged.
+        // High-entropy body, but app-data TLS-prefixed ⇒ not flagged.
         let mut opening = TLS_PREFIX.to_vec();
         opening.extend_from_slice(&[0x5a; 64]);
         assert!(!looks_fully_encrypted(&opening));
+        // A handshake (ClientHello) record header is equally exempt.
+        let mut ch = vec![0x16, 0x03, 0x01];
+        ch.extend_from_slice(&[0x5a; 64]);
+        assert!(is_tls_record_header(&ch));
+        assert!(!looks_fully_encrypted(&ch));
         // Same high-entropy body without the prefix would be flagged.
         let raw: Vec<u8> = (0..64u16)
             .map(|i| (i.wrapping_mul(53) ^ 0xa7) as u8)

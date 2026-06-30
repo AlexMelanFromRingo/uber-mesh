@@ -18,6 +18,7 @@ pub mod handshake;
 pub mod profile;
 pub mod secure;
 pub mod shaping;
+pub mod tls;
 pub mod transport;
 pub mod wire;
 

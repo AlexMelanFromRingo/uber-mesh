@@ -16,7 +16,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use umesh_obfs::wire::looks_fully_encrypted;
+use umesh_obfs::wire::{is_tls_record_header, looks_fully_encrypted};
 use umesh_obfs::{ObfsPsk, ObfsTcp, ShapingPolicy};
 
 /// A censor box: peek the first bytes; if they look fully-encrypted (no recognizable header + high
@@ -248,5 +248,98 @@ async fn naive_proxy_is_unmasked_by_active_probing() {
     assert!(
         blocked.load(Ordering::SeqCst) >= 1,
         "active probing must unmask a naive always-answering server"
+    );
+}
+
+// ── TLS state-machine censor ─────────────────────────────────────────────────────────────────────
+// A stricter censor that enforces the TLS handshake state machine: a genuine TLS flow MUST open with
+// a *handshake* record (ClientHello, content_type 0x16). A flow that opens with application-data
+// (0x17) before any handshake is anomalous → DROP. This is exactly the heuristic that flagged the old
+// app-data-first obfs carrier; the ClientHello-mimicry first flight now passes it.
+
+async fn state_machine_dpi(
+    upstream_port: u16,
+    allowed: Arc<AtomicUsize>,
+    blocked: Arc<AtomicUsize>,
+) -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut inbound, _)) = l.accept().await else {
+                break;
+            };
+            let (allowed, blocked) = (allowed.clone(), blocked.clone());
+            tokio::spawn(async move {
+                let mut peek = vec![0u8; 64];
+                let n = match tokio::time::timeout(Duration::from_secs(5), inbound.read(&mut peek))
+                    .await
+                {
+                    Ok(Ok(n)) if n > 0 => n,
+                    _ => return,
+                };
+                // The first record must be a TLS *handshake* (ClientHello), not application-data.
+                if !is_tls_record_header(&peek[..n]) || peek[0] != 0x16 {
+                    blocked.fetch_add(1, Ordering::SeqCst); // CENSOR: app-data before handshake
+                    return;
+                }
+                allowed.fetch_add(1, Ordering::SeqCst);
+                if let Ok(mut up) = TcpStream::connect(("127.0.0.1", upstream_port)).await {
+                    let _ = up.write_all(&peek[..n]).await;
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut up).await;
+                }
+            });
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn obfs_passes_tls_state_machine_dpi() {
+    let psk = ObfsPsk([6u8; 32]);
+    let upstream = spawn_obfs_echo(psk.clone()).await;
+    let (allowed, blocked) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let box_port = state_machine_dpi(upstream, allowed.clone(), blocked.clone()).await;
+
+    // The obfs first flight is a ClientHello (0x16) ⇒ accepted by the state-machine censor; the
+    // handshake and data exchange complete *through* it.
+    let mut c = ObfsTcp::connect(("127.0.0.1", box_port), &psk, ShapingPolicy::aggressive())
+        .await
+        .expect("obfs handshake must pass the TLS-state-machine DPI (opens with a ClientHello)");
+    c.send(b"clienthello-first").await.unwrap();
+    assert_eq!(c.recv().await.unwrap(), b"clienthello-first");
+    assert!(
+        allowed.load(Ordering::SeqCst) >= 1,
+        "obfs flow must be ALLOWED by the TLS-state-machine box"
+    );
+    assert_eq!(blocked.load(Ordering::SeqCst), 0, "obfs flow must not be blocked");
+}
+
+#[tokio::test]
+async fn appdata_first_flow_is_blocked_by_state_machine() {
+    // A carrier that opens with a TLS *application-data* record (the old obfs behaviour, and what any
+    // "looks-like-TLS" obfuscator without handshake mimicry emits) is anomalous to a state-machine
+    // censor — proving the box genuinely enforces the state machine, so the pass above is meaningful.
+    let upstream = spawn_echo_server().await;
+    let (allowed, blocked) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let box_port = state_machine_dpi(upstream, allowed.clone(), blocked.clone()).await;
+
+    let mut client = TcpStream::connect(("127.0.0.1", box_port)).await.unwrap();
+    // 0x17 = application-data, low-entropy body: passes a naive entropy filter but NOT the state
+    // machine (no preceding handshake).
+    let mut rec = vec![0x17, 0x03, 0x03, 0x00, 0x08];
+    rec.extend_from_slice(&[0x20; 8]);
+    client.write_all(&rec).await.unwrap();
+
+    let mut b = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(3), client.read(&mut b))
+        .await
+        .unwrap_or(Ok(0))
+        .unwrap_or(0);
+    assert_eq!(n, 0, "an app-data-first flow is cut by the state-machine censor");
+    assert_eq!(allowed.load(Ordering::SeqCst), 0, "app-data-first flow must not be allowed");
+    assert!(
+        blocked.load(Ordering::SeqCst) >= 1,
+        "an app-data-first flow must be BLOCKED by the TLS-state-machine box"
     );
 }

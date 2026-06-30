@@ -43,15 +43,28 @@ exercised or tested in a software-only session. They are *not* stubbed or faked.
 pluggability is in place (obfs-tcp is the first carrier; the fallback-proxy variant is the second probe
 policy), so each is an additive carrier behind the same seam.
 
-### 2.1 Native REALITY (full Xray interop) — *partially delivered*
+### 2.1 Native REALITY (full Xray interop) — *largely delivered; byte-exact fingerprint deferred*
 
-- **Delivered:** REALITY's load-bearing idea — **active-probe resistance via transparent reverse-proxy to a
-  real cover site** — is implemented and tested (`ProbeResponse::Fallback`, `dpi_sim::probe_is_proxied_to_cover_site`).
-  A prober with the wrong PSK receives a genuine site's content.
-- **Deferred:** byte-for-byte REALITY wire interop (X25519 short-id auth smuggled in a real TLS 1.3
-  ClientHello SessionID; stealing a third-party ServerHello; faithful post-handshake `NewSessionTicket`
-  relay to evade the Aparecium distinguisher, dossier §1). This needs a TLS stack with ClientHello control
-  (`craftls`/`boring`) and Go-Xray interop testing. Gated behind a future `reality` feature flag.
+- **Delivered — active-probe resistance:** REALITY's load-bearing idea — **transparent reverse-proxy to a
+  real cover site** for any connection that fails the gate — is implemented and tested
+  (`ProbeResponse::Fallback`, `dpi_sim::probe_is_proxied_to_cover_site`). A prober with the wrong PSK
+  receives a genuine site's content.
+- **Delivered — TLS-state-machine mimicry (`umesh-obfs::tls`):** the obfs handshake now rides a
+  **structurally-valid TLS 1.3 ClientHello** (record type `0x16`) with a PQ-hybrid `X25519MLKEM768`
+  key_share carrying the X25519 + ML-KEM-768 material, answered by a ServerHello; the PSK auth gate is a
+  keyed MAC smuggled in the 32-byte `session_id` (REALITY's short-id-in-SessionID idea). The flow therefore
+  opens *ClientHello → ServerHello → application-data* — a valid TLS state-machine opening that defeats the
+  "handshake-must-precede-app-data" heuristic that flagged the old app-data-first carrier
+  (`dpi_middlebox::obfs_passes_tls_state_machine_dpi`; `dpi_middlebox::appdata_first_flow_is_blocked_by_state_machine`
+  shows the censor genuinely enforces it). The 1216-byte PQ key_share blends with real X25519MLKEM768 TLS
+  (Chrome/Cloudflare default since 2024).
+- **Deferred — byte-exact fingerprint + full transcript:** this is *structurally* valid, not a
+  byte-for-byte **uTLS fingerprint** of a specific browser (JA3/JA4 — extension order/GREASE/ALPN are a
+  fixed, recognizable set; the cover SNI is a single `UMESH_SNI` default), and the transcript is not a full
+  TLS 1.3 handshake (no real EncryptedExtensions/Certificate/Finished — a DPI doing full-transcript
+  validation, or stealing a third-party ServerHello to evade the Aparecium distinguisher (dossier §1), would
+  still distinguish it). Closing that needs a real TLS stack with ClientHello control (`craftls`/`boring`)
+  and Go-Xray interop testing. Gated behind a future `reality` feature flag.
 
 ### 2.2 QUIC + Salamander datapath — *deferred*
 
@@ -86,7 +99,8 @@ policy), so each is an additive carrier behind the same seam.
 | Hybrid-PQ confidentiality (data path) | ✅ implemented + tested | `umesh-crypto::kem`, obfs handshake |
 | Hybrid-PQ libp2p Noise upgrade | 📐 resolved by design (not needed for HNDL; optional DiD) | §1 |
 | REALITY active-probe resistance (fallback proxy) | ✅ implemented + tested | `ProbeResponse::Fallback` |
-| REALITY full Xray wire interop | 📐 designed; needs TLS-fingerprint stack | §2.1 |
+| TLS 1.3 ClientHello mimicry (state-machine DPI) | ✅ implemented + tested | `umesh-obfs::tls`, §2.1 |
+| REALITY byte-exact uTLS fingerprint + full transcript | 📐 designed; needs TLS-fingerprint stack | §2.1 |
 | QUIC + Salamander | 📐 designed; needs `quinn` UDP access | §2.2 |
 | AmneziaWG | 📐 designed; needs WireGuard core | §2.3 |
 | Local-RF blackout tier | 📐 designed; needs radio hardware | §2.4 |

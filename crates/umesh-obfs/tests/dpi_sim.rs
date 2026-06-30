@@ -3,7 +3,7 @@
 //! Exercises the obfs-tcp transport over real loopback TCP against a simulated censor:
 //!   1. establishment + authenticated data exchange,
 //!   2. active-probe resistance (a prober receives no distinguishing reply → silence + close),
-//!   3. first-flight entropy mitigation (the wire opens with a TLS record header),
+//!   3. first-flight mimicry (the wire opens with a structurally-valid TLS 1.3 ClientHello),
 //!   4. connect-time transport rotation past a dead endpoint.
 
 use std::sync::Arc;
@@ -13,13 +13,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
-use umesh_obfs::wire::{TLS_PREFIX, looks_fully_encrypted};
+use umesh_obfs::wire::{TLS_PREFIX, is_tls_record_header, looks_fully_encrypted};
 use umesh_obfs::{
     Endpoint, ObfsError, ObfsPsk, ObfsTcp, ProbeResponse, ShapingPolicy, connect_first_working,
     server_handshake_probe,
 };
 
-const FLIGHT1_LEN: usize = 16 + 32 + 1184 + 8 + 16;
+/// A plausible TLS record size for a junk probe (not a valid ClientHello).
+const PROBE_REC_LEN: usize = 1264;
 
 /// 1. A client and server complete the obfs handshake and exchange an authenticated message.
 #[tokio::test]
@@ -46,7 +47,8 @@ async fn establishes_and_exchanges_data() {
     server.await.unwrap();
 }
 
-/// 2. An active prober (record-shaped junk, wrong MAC) receives no bytes — only silence then close.
+/// 2. An active prober (record-shaped junk, not a valid ClientHello) receives no bytes — only
+///    silence then close.
 #[tokio::test]
 async fn active_probe_gets_silence() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -60,11 +62,11 @@ async fn active_probe_gets_silence() {
         );
     });
 
-    // Probe: a correctly-framed flight-1-sized record full of junk → MAC mismatch.
+    // Probe: a correctly-framed record full of junk → does not parse as a gated ClientHello.
     let mut probe = TcpStream::connect(addr).await.unwrap();
     let mut rec = vec![TLS_PREFIX[0], TLS_PREFIX[1], TLS_PREFIX[2], 0, 0];
-    rec[3..5].copy_from_slice(&(FLIGHT1_LEN as u16).to_be_bytes());
-    rec.extend_from_slice(&vec![0u8; FLIGHT1_LEN]);
+    rec[3..5].copy_from_slice(&(PROBE_REC_LEN as u16).to_be_bytes());
+    rec.extend_from_slice(&vec![0u8; PROBE_REC_LEN]);
     probe.write_all(&rec).await.unwrap();
 
     let mut buf = [0u8; 32];
@@ -76,9 +78,12 @@ async fn active_probe_gets_silence() {
     server.await.unwrap();
 }
 
-/// 3. The first flight on the wire opens with a TLS record header (defeats the no-header classifier).
+/// 3. The first flight on the wire is a structurally-valid TLS 1.3 ClientHello (handshake record
+///    `0x16` carrying a PQ-hybrid X25519MLKEM768 key_share) — it defeats both the no-header entropy
+///    classifier AND the TLS-state-machine heuristic (a real TLS flow opens with a ClientHello, not
+///    application data).
 #[tokio::test]
-async fn first_flight_is_tls_prefixed() {
+async fn first_flight_is_a_client_hello() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
@@ -87,8 +92,14 @@ async fn first_flight_is_tls_prefixed() {
     let recorder = tokio::spawn(async move {
         let (mut s, _) = listener.accept().await.unwrap();
         let mut hdr = [0u8; 5];
-        let _ = s.read_exact(&mut hdr).await;
-        cap2.lock().await.extend_from_slice(&hdr);
+        if s.read_exact(&mut hdr).await.is_ok() {
+            let len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+            let mut body = vec![0u8; len];
+            let _ = s.read_exact(&mut body).await;
+            let mut rec = hdr.to_vec();
+            rec.extend_from_slice(&body);
+            cap2.lock().await.extend_from_slice(&rec);
+        }
         // drop the connection — the client's handshake will then error, which is fine here.
     });
 
@@ -96,15 +107,21 @@ async fn first_flight_is_tls_prefixed() {
     recorder.await.unwrap();
 
     let first = captured.lock().await.clone();
-    assert!(first.len() >= 3);
-    assert_eq!(
-        &first[..3],
-        &TLS_PREFIX,
-        "carrier must open with a TLS record header"
-    );
+    assert!(first.len() >= 5);
+    // Opens with a TLS *handshake* record (0x16), not application-data.
+    assert_eq!(first[0], 0x16, "first flight must be a TLS handshake record");
+    assert!(is_tls_record_header(&first));
     assert!(
         !looks_fully_encrypted(&first),
         "censor classifier must not flag the opening"
+    );
+    // ...and it parses as a real ClientHello carrying the 1216-byte PQ-hybrid key_share.
+    let (_sid, key_share) = umesh_obfs::tls::parse_client_hello(&first)
+        .expect("first flight must parse as a TLS 1.3 ClientHello");
+    assert_eq!(
+        key_share.len(),
+        1184 + 32,
+        "X25519MLKEM768 key_share = ml-kem-768 ek ‖ x25519 pub"
     );
 }
 
@@ -171,7 +188,8 @@ async fn probe_is_proxied_to_cover_site() {
         }
     });
 
-    // A prober sends a flight-shaped junk record (wrong PSK) and should receive the cover content.
+    // A prober sends a record-shaped junk flight (not a gated ClientHello) and should receive the
+    // cover content rather than anything that distinguishes uber-mesh.
     let mut probe = TcpStream::connect(&srv_addr).await.unwrap();
     let body = vec![0u8; 1264];
     let mut rec = vec![TLS_PREFIX[0], TLS_PREFIX[1], TLS_PREFIX[2], 0, 0];

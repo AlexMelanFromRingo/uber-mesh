@@ -45,6 +45,10 @@ A censor in the connection path. Verified:
   framing exempt; handshake + data complete through the censor); a **raw high-entropy flow is blocked**.
 - ✅ **Active probing**: the censor probes suspect servers — obfs answers with **silence** → not
   unmasked → allowed; a naive always-answering proxy **is unmasked** → blocked.
+- ✅ **TLS state-machine** ("a real TLS flow must open with a ClientHello, not application-data"): obfs
+  **passes** — its first flight is a structurally-valid TLS 1.3 ClientHello (`0x16`) with a PQ-hybrid
+  X25519MLKEM768 key_share; an **app-data-first flow (the old carrier) is blocked**, proving the box
+  genuinely enforces the state machine.
 
 ## 5. Throughput (saturation) — `cargo run --release --example throughput`
 
@@ -82,13 +86,19 @@ resource metrics, real `tc netem` (loss/latency/reorder/duplicate/corrupt), chao
 entropy **+ active-probing** DPI middlebox the obfs passes, saturation throughput, geo-emulation (faithful
 per-region RTT), and a multi-minute soak with no leak. Handshake p95 ≤ 150 ms (SC) met under normal netem.
 
+**Closed since:** the obfs first flight is now a **structurally-valid TLS 1.3 ClientHello** (`0x16`,
+PQ-hybrid X25519MLKEM768 key_share; PSK gate in the `session_id`), so the flow opens *ClientHello →
+ServerHello → app-data* and passes the TLS-state-machine heuristic (test §4). What remains deferred is
+**byte-exact uTLS fingerprint** mimicry (JA3/JA4: a fixed extension set, single default SNI) and a full
+TLS-1.3 transcript — those need a real TLS stack (native REALITY, `docs/security-and-deferred.md`).
+
 **Still NOT closed — fundamentally out of reach here (will not fake):**
 - **Real nation-state DPI / in-country (Iran/Russia) survivability** — needs access to those networks;
-  the middlebox is a faithful model of the primary heuristic, not a real censor with ML classifiers or
-  TLS-state-machine analysis at scale.
-- **Note:** the obfs first flight is a TLS *Application-Data* record, not a real ClientHello — a strict
-  TLS-state-machine DPI ("handshake must precede app-data") would flag it. Full ClientHello mimicry =
-  the deferred native-REALITY work (`docs/security-and-deferred.md`).
+  the middlebox is a faithful model of the primary heuristics (entropy, active-probing, TLS state machine),
+  not a real censor with ML classifiers or full-transcript TLS analysis at scale.
+- **Byte-exact TLS fingerprint (JA3/JA4) + full TLS-1.3 transcript** — the ClientHello is structurally
+  valid but not byte-identical to a specific browser, and there is no real EncryptedExtensions/Certificate/
+  Finished; a DPI doing full-transcript validation would still distinguish it (deferred native-REALITY).
 - **True geographic distribution** across real datacenters/CGNAT/asymmetric paths — emulated via netem on
   a single host, not real.
 - **Long soak** (hours/days) and **Grafana visual** validation (verified via API, not a rendered screen).
