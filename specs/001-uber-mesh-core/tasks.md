@@ -58,9 +58,12 @@ Beyond unit/integration tests — real multi-node runs + metrics + impairment (s
   latency; mesh forms and signed heartbeats propagate. `005173a`
 - ✅ **Prometheus metrics** — `/metrics` on every node (peers, gossip, blobs, sync, handshake
   histogram); scalable compose + Prometheus DNS-SD scrape; runner queries aggregate metrics. `34fecf0`,(this change)
-- 🔄 **In progress:** scale Docker to 100 nodes + Prometheus pipeline; DPI-middlebox container
-  (entropy/SNI classifier + active probing) verifying obfs/REALITY-fallback pass it; netem
-  reorder/duplicate/corrupt; chaos/partition + soak.
+- ✅ **Docker scale to 100 nodes + Prometheus** — 100 nodes scraped, 25,540 gossip msgs under netem
+  (loss 2% + 50ms±10); **obfs handshake p95=147ms (< 150ms SC target)**. `2833949`
+- ✅ **DPI middlebox** — entropy-classifier censor in the path: obfs PASSES, raw high-entropy flow
+  BLOCKED (`tests/dpi_middlebox.rs`). `05b292c`
+- ✅ **Heavy netem + chaos** — loss/reorder/duplicate/corrupt + killing 12/50 nodes mid-run; survivors
+  keep gossiping (3,741 msgs). Honest caveats (geo, real-DPI, soak) in `docs/benchmarks.md`.
 
 ## Format: `[ID] [P?] [Story] Description`
 

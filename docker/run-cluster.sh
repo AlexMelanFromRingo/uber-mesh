@@ -19,8 +19,16 @@ echo "=== bringing up cluster: 1 bootstrap + ${SCALE} nodes + prometheus, under 
 $COMPOSE up -d --force-recreate --scale node="$SCALE" >/dev/null 2>&1
 trap '$COMPOSE down -v --remove-orphans >/dev/null 2>&1 || true' EXIT
 
+HALF=$((DURATION / 2))
 echo "running for ${DURATION}s (nodes form the mesh; prometheus scrapes every 5s)..."
-sleep "$DURATION"
+sleep "$HALF"
+
+# Optional chaos: kill CHAOS node containers mid-run to test mesh resilience to churn/partition.
+if [ "${CHAOS:-0}" -gt 0 ]; then
+    echo "=== CHAOS: killing ${CHAOS} node containers mid-run ==="
+    $COMPOSE ps -q node | head -n "$CHAOS" | xargs -r docker kill >/dev/null 2>&1 || true
+fi
+sleep $((DURATION - HALF))
 
 # Query Prometheus instant vectors via its HTTP API.
 q() { curl -sG "$PROM/api/v1/query" --data-urlencode "query=$1" \
