@@ -15,6 +15,7 @@ use crate::behaviour::{MeshBehaviour, MeshBehaviourEvent};
 use crate::blobs::{BlobRequest, BlobResponse};
 use crate::error::{P2pError, Result};
 use crate::gossip::{self, ReplayGuard, SignedMessage};
+use crate::metrics;
 use crate::reconcile::{self, Reconciler};
 use crate::store::ContentStore;
 use crate::sync::ReconcileMsg;
@@ -196,6 +197,7 @@ impl MeshNode {
             .gossipsub
             .publish(t, msg.encode())
             .map_err(|e| P2pError::Publish(e.to_string()))?;
+        metrics::inc(&metrics::GOSSIP_PUBLISHED);
         Ok(())
     }
 
@@ -226,6 +228,7 @@ impl MeshNode {
                                     &propagation_source,
                                     gossipsub::MessageAcceptance::Accept,
                                 );
+                            metrics::inc(&metrics::GOSSIP_RECEIVED);
                             return MeshEvent::Message {
                                 topic,
                                 sender,
@@ -234,6 +237,7 @@ impl MeshNode {
                         }
                         Err(e) => {
                             // Reject ⇒ penalize the forwarding peer's score, do not propagate.
+                            metrics::inc(&metrics::GOSSIP_REJECTED);
                             tracing::debug!(error = %e, "rejected invalid gossip message");
                             let _ = self
                                 .swarm
@@ -261,6 +265,7 @@ impl MeshNode {
                             .behaviour_mut()
                             .blobs
                             .send_response(channel, BlobResponse { data });
+                        metrics::inc(&metrics::BLOBS_SERVED);
                     }
                     request_response::Message::Response {
                         request_id,
@@ -272,6 +277,7 @@ impl MeshNode {
                                 // Verify BLAKE3(bytes) == cid before trusting the content (FR-011).
                                 Some(data) if cid.verifies(&data) => {
                                     self.store.put(data.clone());
+                                    metrics::inc(&metrics::BLOBS_RECEIVED);
                                     return MeshEvent::BlobReceived { cid, data };
                                 }
                                 _ => return MeshEvent::BlobUnavailable { cid },
@@ -312,6 +318,7 @@ impl MeshNode {
                                 if reconcile::is_converged(&next) {
                                     let diff = std::mem::take(&mut session.rec.diff);
                                     self.sync_sessions.remove(&peer);
+                                    metrics::inc(&metrics::SYNC_COMPLETED);
                                     return MeshEvent::SyncComplete {
                                         peer,
                                         need: diff.need.into_iter().map(Cid).collect(),
@@ -337,9 +344,11 @@ impl MeshNode {
                     }
                 }
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                    metrics::peers_delta(1);
                     return MeshEvent::PeerConnected(peer_id);
                 }
                 SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                    metrics::peers_delta(-1);
                     return MeshEvent::PeerDisconnected(peer_id);
                 }
                 SwarmEvent::NewListenAddr { address, .. } => {

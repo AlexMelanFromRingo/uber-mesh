@@ -12,6 +12,7 @@ pub mod behaviour;
 pub mod blobs;
 pub mod error;
 pub mod gossip;
+pub mod metrics;
 pub mod node;
 pub mod reconcile;
 pub mod store;

@@ -144,12 +144,24 @@ pub fn build_swarm(seed: &[u8; 32], psk: ObfsPsk) -> Result<Swarm<MeshBehaviour>
                     async move {
                         // Bridge libp2p's futures-io stream to our tokio-based obfs handshake.
                         let mut tk = conn.compat();
-                        let keys = if point.is_dialer() {
+                        let started = std::time::Instant::now();
+                        let result = if point.is_dialer() {
                             client_handshake(&mut tk, &psk).await
                         } else {
                             server_handshake(&mut tk, &psk).await
-                        }
-                        .map_err(|e| io::Error::other(e.to_string()))?;
+                        };
+                        let keys = match result {
+                            Ok(k) => {
+                                crate::metrics::record_handshake(
+                                    started.elapsed().as_millis() as u64
+                                );
+                                k
+                            }
+                            Err(e) => {
+                                crate::metrics::inc(&crate::metrics::HANDSHAKE_FAILS);
+                                return Err(io::Error::other(e.to_string()));
+                            }
+                        };
                         // Expose the obfs byte stream back as futures-io for the Noise/Yamux upgrade.
                         Ok::<_, io::Error>(ObfsByteStream::new(tk, keys).compat())
                     }

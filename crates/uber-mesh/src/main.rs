@@ -63,6 +63,31 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     }
 }
 
+/// Minimal Prometheus `/metrics` HTTP server (no framework — the exposition format is plain text).
+async fn serve_metrics(addr: String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let Ok(listener) = tokio::net::TcpListener::bind(&addr).await else {
+        tracing::warn!(%addr, "could not bind metrics endpoint");
+        return;
+    };
+    loop {
+        let Ok((mut sock, _)) = listener.accept().await else {
+            continue;
+        };
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await; // ignore the request line/headers
+            let body = umesh_p2p::metrics::render();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+        });
+    }
+}
+
 async fn cmd_mesh(
     dd: &DataDir,
     listen: Option<String>,
@@ -95,11 +120,18 @@ async fn cmd_mesh(
         }
     }
 
+    // Prometheus /metrics endpoint (METRICS_PORT, default 9100; set to "off" to disable).
+    let metrics_port = std::env::var("METRICS_PORT").unwrap_or_else(|_| "9100".to_string());
+    if metrics_port != "off" {
+        tokio::spawn(serve_metrics(format!("0.0.0.0:{metrics_port}")));
+    }
+
     println!(
-        "uber-mesh gossip node started\n  libp2p peer: {}\n  app peer:    {}\n  topic:       {}",
+        "uber-mesh gossip node started\n  libp2p peer: {}\n  app peer:    {}\n  topic:       {}\n  metrics:     :{}/metrics",
         node.local_peer_id(),
         node.app_peer_id(),
-        topic
+        topic,
+        metrics_port,
     );
 
     let local = node.local_peer_id();
