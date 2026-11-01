@@ -9,7 +9,7 @@ use umesh_p2p::{MeshEvent, MeshNode};
 
 #[tokio::test]
 async fn requests_and_verifies_a_blob() {
-    let psk = ObfsPsk([8u8; 32]);
+    let psk = ObfsPsk::new([8u8; 32]);
     let mut a = MeshNode::new(&[1u8; 32], psk.clone()).unwrap();
     let mut b = MeshNode::new(&[2u8; 32], psk).unwrap();
     let a_peer = a.local_peer_id();
@@ -54,7 +54,7 @@ async fn requests_and_verifies_a_blob() {
 
 #[tokio::test]
 async fn unknown_blob_is_unavailable() {
-    let psk = ObfsPsk([9u8; 32]);
+    let psk = ObfsPsk::new([9u8; 32]);
     let mut a = MeshNode::new(&[3u8; 32], psk.clone()).unwrap();
     let mut b = MeshNode::new(&[4u8; 32], psk).unwrap();
     let a_peer = a.local_peer_id();

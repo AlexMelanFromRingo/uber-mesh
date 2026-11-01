@@ -13,7 +13,6 @@ umesh-obfs.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
-lru.workspace = true
 bincode.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

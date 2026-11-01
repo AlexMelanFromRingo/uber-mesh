@@ -3,14 +3,15 @@
 //! Every object is keyed by `BLAKE3(content)`, so a receiver can verify retrieved bytes against the
 //! id before trusting them. This is the local cache the blob request/response protocol serves from.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use umesh_crypto::hash::Cid;
 
 /// A bounded-by-caller in-memory content store.
 #[derive(Default)]
 pub struct ContentStore {
-    map: HashMap<[u8; 32], Vec<u8>>,
+    // Ordered so `ids_sorted` (called per inbound reconcile round) is a linear copy, not a sort.
+    map: BTreeMap<[u8; 32], Vec<u8>>,
 }
 
 impl ContentStore {
@@ -38,9 +39,7 @@ impl ContentStore {
 
     /// All stored content ids, sorted ascending (for set reconciliation).
     pub fn ids_sorted(&self) -> Vec<[u8; 32]> {
-        let mut ids: Vec<[u8; 32]> = self.map.keys().copied().collect();
-        ids.sort_unstable();
-        ids
+        self.map.keys().copied().collect()
     }
 
     /// Number of stored objects.

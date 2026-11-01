@@ -1,28 +1,57 @@
 //! Signed gossip messages + replay protection (contracts/message-wire.md).
 //!
 //! Every message is authenticated to its sender and content-addressed. Validation has a stateless
-//! part (identity binding, signature, payload hash) and a stateful part (monotonic per-sender seqno,
-//! timestamp window, bounded dedup) — gossipsub's own dedup does NOT survive cache eviction, so the
-//! monotonic seqno is enforced here at the application layer (research D10 / mesh-integrity).
+//! part (identity binding, signature, payload hash, topic binding) and a stateful part (per-sender
+//! sliding replay window, timestamp window, bounded dedup) — gossipsub's own dedup does NOT survive
+//! cache eviction, so replay protection is enforced here at the application layer (research D10 /
+//! mesh-integrity). All stateful structures are bounded and expire, since remote peers pick the keys.
 
-use std::collections::HashMap;
-use std::num::NonZeroUsize;
+use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use lru::LruCache;
 use thiserror::Error;
 use umesh_crypto::hash::{self, Hash32};
 use umesh_crypto::identity::{self, NodeIdentity, PeerId};
 
+use crate::bounded::BoundedMap;
+
 /// Message format version.
 pub const MSG_VERSION: u8 = 1;
 const SIG_LABEL: &[u8] = b"uber-mesh-msg-v1";
-const MSGID_LABEL: &[u8] = b"uber-mesh-msgid-v1";
+/// BLAKE3 `derive_key` context for message-ids. The id covers the **full canonical encoding**
+/// (including the payload), so two different byte strings can never share an id — a forged copy
+/// with a swapped payload cannot poison the gossipsub duplicate cache for the genuine message.
+pub const MSGID_CONTEXT: &str = "uber-mesh v1 gossip message-id";
 
 /// Default acceptable clock skew for message timestamps (±5 minutes).
 pub const DEFAULT_SKEW_MS: u64 = 5 * 60 * 1000;
 /// Default dedup cache capacity (message-ids retained).
 pub const DEFAULT_DEDUP_CAP: usize = 65536;
+/// Default cap on tracked senders (per-sender replay windows).
+pub const DEFAULT_SENDER_CAP: usize = 16384;
+/// Seqnos remembered per sender inside its replay window (out-of-order tolerance).
+pub const REPLAY_WINDOW_SEQNOS: usize = 256;
+
+/// Wall-clock now in unix microseconds.
+pub fn now_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
+}
+
+/// Next publisher seqno: `max(last + 1, now_µs)`. Time-based, so a restarted node (same identity,
+/// fresh process state) continues above anything it sent before instead of restarting at 1 and
+/// being silenced as a replay by every peer.
+pub fn next_seqno(last: u64, now_us: u64) -> u64 {
+    last.saturating_add(1).max(now_us)
+}
+
+/// The message-id of a canonical encoding: `BLAKE3-derive_key(MSGID_CONTEXT, encoded)`.
+/// Also used as the gossipsub message-id function for arbitrary (possibly invalid) data.
+pub fn message_id_of(encoded: &[u8]) -> Hash32 {
+    hash::derive_key(MSGID_CONTEXT, encoded)
+}
 
 /// Wall-clock now in unix milliseconds.
 pub fn now_millis() -> u64 {
@@ -50,8 +79,8 @@ pub enum MsgError {
     /// `BLAKE3(payload) != payload_hash`.
     #[error("payload hash mismatch")]
     PayloadHash,
-    /// `seqno <= last seen for this sender`.
-    #[error("non-monotonic seqno (replay)")]
+    /// Seqno already seen for this sender, or older than its replay window.
+    #[error("replayed or stale seqno")]
     Replay,
     /// Timestamp outside the accepted skew window.
     #[error("timestamp outside window")]
@@ -59,6 +88,23 @@ pub enum MsgError {
     /// Already-seen message-id.
     #[error("duplicate message")]
     Duplicate,
+    /// The signed topic differs from the gossipsub topic the message arrived on.
+    #[error("signed topic does not match delivery topic")]
+    TopicMismatch,
+}
+
+impl MsgError {
+    /// Whether the message is provably invalid (forged/tampered/malformed/cross-topic), so the
+    /// forwarding peer should be penalized (gossipsub `Reject`, P4). Replays, duplicates and
+    /// out-of-window timestamps can be relayed by honest peers (or caused by our own state/clock)
+    /// and are only `Ignore`d — never scored. An unknown version is also ignored, so peers that
+    /// upgraded first aren't penalized by older ones.
+    pub fn is_invalid(&self) -> bool {
+        !matches!(
+            self,
+            MsgError::Replay | MsgError::Duplicate | MsgError::Timestamp | MsgError::Version
+        )
+    }
 }
 
 /// A signed, content-addressed gossip message.
@@ -70,7 +116,7 @@ pub struct SignedMessage {
     pub sender: [u8; 32],
     /// Sender Ed25519 verifying key.
     pub sender_key: [u8; 32],
-    /// Per-sender monotonic sequence number.
+    /// Per-sender sequence number (time-based: `max(last + 1, now_µs)`).
     pub seqno: u64,
     /// Unix-millis timestamp.
     pub timestamp: u64,
@@ -139,14 +185,10 @@ impl SignedMessage {
         )
     }
 
-    /// Deterministic content id of this message.
+    /// Deterministic content id of this message: [`message_id_of`] its canonical encoding
+    /// (covers every field, payload included).
     pub fn message_id(&self) -> Hash32 {
-        let t = self.transcript();
-        let mut buf = Vec::with_capacity(MSGID_LABEL.len() + t.len() + 64);
-        buf.extend_from_slice(MSGID_LABEL);
-        buf.extend_from_slice(&t);
-        buf.extend_from_slice(&self.sig);
-        hash::hash(&buf)
+        message_id_of(&self.encode())
     }
 
     /// Stateless validation: identity binding, signature, payload hash. Returns the bound PeerId.
@@ -249,21 +291,48 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// Stateful anti-replay: per-sender monotonic seqno, timestamp window, bounded message-id dedup.
+/// Per-sender replay window: every seqno `<= floor` is rejected; seqnos above `floor` are accepted
+/// once each (`recent` remembers them). `floor` trails the highest seqno by the skew window and is
+/// raised whenever `recent` overflows, so state per sender is `O(REPLAY_WINDOW_SEQNOS)`.
+struct SenderWindow {
+    floor: u64,
+    high: u64,
+    recent: BTreeSet<u64>,
+    last_ms: u64,
+}
+
+/// Stateful anti-replay: per-sender sliding seqno window, timestamp window, bounded message-id
+/// dedup. Both maps are capacity-bounded and entries expire `2·skew` after their last use (after
+/// which any replay of the messages they protected fails the timestamp check anyway).
 pub struct ReplayGuard {
-    last_seqno: HashMap<[u8; 32], u64>,
-    seen: LruCache<Hash32, ()>,
+    senders: BoundedMap<[u8; 32], SenderWindow>,
+    seen: BoundedMap<Hash32, u64>,
     skew_ms: u64,
 }
 
 impl ReplayGuard {
     /// Create a guard with the given skew window and dedup capacity.
     pub fn new(skew_ms: u64, dedup_cap: usize) -> Self {
+        ReplayGuard::with_limits(skew_ms, dedup_cap, DEFAULT_SENDER_CAP)
+    }
+
+    /// Create a guard with explicit dedup and tracked-sender capacities.
+    pub fn with_limits(skew_ms: u64, dedup_cap: usize, sender_cap: usize) -> Self {
         ReplayGuard {
-            last_seqno: HashMap::new(),
-            seen: LruCache::new(NonZeroUsize::new(dedup_cap.max(1)).unwrap()),
+            senders: BoundedMap::new(sender_cap),
+            seen: BoundedMap::new(dedup_cap),
             skew_ms,
         }
+    }
+
+    /// Number of senders currently tracked (bounded by the sender cap).
+    pub fn tracked_senders(&self) -> usize {
+        self.senders.len()
+    }
+
+    /// Number of message-ids currently remembered (bounded by the dedup cap).
+    pub fn tracked_ids(&self) -> usize {
+        self.seen.len()
     }
 
     /// Check freshness/ordering/uniqueness and, on success, record the message. Does NOT verify
@@ -272,17 +341,48 @@ impl ReplayGuard {
         if now_ms.abs_diff(msg.timestamp) > self.skew_ms {
             return Err(MsgError::Timestamp);
         }
+        // Expire state that can no longer matter: a message accepted at `t` carries a timestamp
+        // within `t ± skew`, so after `t + 2·skew` every replay of it fails the timestamp check.
+        let retain = self.skew_ms.saturating_mul(2);
+        self.seen
+            .expire_oldest_while(|&t| now_ms.saturating_sub(t) > retain);
+        self.senders
+            .expire_oldest_while(|w| now_ms.saturating_sub(w.last_ms) > retain);
+
         let id = msg.message_id();
-        if self.seen.contains(&id) {
+        if self.seen.contains_key(&id) {
             return Err(MsgError::Duplicate);
         }
-        if let Some(&last) = self.last_seqno.get(&msg.sender) {
-            if msg.seqno <= last {
-                return Err(MsgError::Replay);
+        if let Some(w) = self.senders.get(&msg.sender)
+            && (msg.seqno <= w.floor || w.recent.contains(&msg.seqno))
+        {
+            return Err(MsgError::Replay);
+        }
+
+        // Accept: record the seqno in the sender's window and slide it.
+        let window_us = self.skew_ms.saturating_mul(1000);
+        let w = self
+            .senders
+            .touch_or_insert_with(msg.sender, || SenderWindow {
+                floor: 0,
+                high: 0,
+                recent: BTreeSet::new(),
+                last_ms: now_ms,
+            });
+        w.last_ms = now_ms;
+        w.recent.insert(msg.seqno);
+        w.high = w.high.max(msg.seqno);
+        let slide_to = w.high.saturating_sub(window_us);
+        if slide_to > w.floor {
+            w.floor = slide_to;
+            w.recent = w.recent.split_off(&(slide_to + 1));
+        }
+        while w.recent.len() > REPLAY_WINDOW_SEQNOS {
+            if let Some(oldest) = w.recent.pop_first() {
+                w.floor = w.floor.max(oldest);
             }
         }
-        self.last_seqno.insert(msg.sender, msg.seqno);
-        self.seen.put(id, ());
+        self.seen.insert(id, now_ms);
         Ok(())
     }
 }
@@ -302,6 +402,20 @@ pub fn validate(
     let peer = msg.validate_stateless()?;
     guard.accept(msg, now_ms)?;
     Ok(peer)
+}
+
+/// [`validate`] plus topic binding: the signed `msg.topic` must equal the (unauthenticated)
+/// gossipsub topic it was delivered on, so a valid message can't be replayed into another topic.
+pub fn validate_on_topic(
+    msg: &SignedMessage,
+    delivered_topic: &str,
+    guard: &mut ReplayGuard,
+    now_ms: u64,
+) -> Result<PeerId, MsgError> {
+    if msg.topic != delivered_topic {
+        return Err(MsgError::TopicMismatch);
+    }
+    validate(msg, guard, now_ms)
 }
 
 #[cfg(test)]
@@ -371,6 +485,112 @@ mod tests {
         let (m, _) = msg(7, 1, 1000, b"x");
         let mut g = ReplayGuard::new(1000, 16); // 1s window
         assert_eq!(validate(&m, &mut g, 1_000_000), Err(MsgError::Timestamp));
+    }
+
+    /// Audit regression (msgid collision): a re-signed copy with a swapped payload used to share
+    /// the genuine message's id (the id excluded the payload), poisoning gossipsub's dedup cache.
+    #[test]
+    fn message_id_covers_payload() {
+        let (genuine, _) = msg(8, 1, 1000, b"genuine");
+        let mut evil = genuine.clone();
+        evil.payload = b"garbage".to_vec(); // payload_hash + sig untouched
+        assert_ne!(evil.message_id(), genuine.message_id());
+        assert_eq!(evil.validate_stateless(), Err(MsgError::PayloadHash));
+        // The gossipsub id fn and the typed id agree on canonical bytes.
+        assert_eq!(message_id_of(&genuine.encode()), genuine.message_id());
+    }
+
+    #[test]
+    fn topic_must_match_delivery_topic() {
+        let (m, _) = msg(9, 1, 1000, b"x"); // signed for "uber-mesh/news"
+        let mut g = ReplayGuard::new(DEFAULT_SKEW_MS, 16);
+        assert_eq!(
+            validate_on_topic(&m, "uber-mesh/other", &mut g, 1000),
+            Err(MsgError::TopicMismatch)
+        );
+        assert!(MsgError::TopicMismatch.is_invalid());
+        // A mismatch must not consume replay state: the genuine delivery still validates.
+        assert!(validate_on_topic(&m, "uber-mesh/news", &mut g, 1000).is_ok());
+    }
+
+    #[test]
+    fn replays_and_duplicates_are_ignored_not_penalized() {
+        assert!(!MsgError::Replay.is_invalid());
+        assert!(!MsgError::Duplicate.is_invalid());
+        assert!(!MsgError::Timestamp.is_invalid());
+        assert!(!MsgError::Version.is_invalid());
+        assert!(MsgError::Signature.is_invalid());
+        assert!(MsgError::PayloadHash.is_invalid());
+        assert!(MsgError::IdentityBinding.is_invalid());
+        assert!(MsgError::Malformed.is_invalid());
+    }
+
+    /// Audit regression: a strict high-water mark dropped legitimately reordered messages.
+    #[test]
+    fn reordered_messages_accepted_once() {
+        let id = NodeIdentity::from_seed(&[10; 32]);
+        let late = SignedMessage::create(&id, "t", b"a".to_vec(), 9_000, 1000);
+        let early = SignedMessage::create(&id, "t", b"b".to_vec(), 10_000, 1000);
+        let mut g = ReplayGuard::new(DEFAULT_SKEW_MS, 16);
+        assert!(validate(&early, &mut g, 1000).is_ok());
+        assert!(validate(&late, &mut g, 1000).is_ok(), "reordered delivery");
+        // Re-signed copy of an accepted seqno (different payload ⇒ different id) is a replay.
+        let again = SignedMessage::create(&id, "t", b"c".to_vec(), 9_000, 1001);
+        assert_eq!(validate(&again, &mut g, 1001), Err(MsgError::Replay));
+    }
+
+    #[test]
+    fn window_floor_rejects_evicted_seqnos() {
+        let id = NodeIdentity::from_seed(&[11; 32]);
+        let mut g = ReplayGuard::new(DEFAULT_SKEW_MS, 4096);
+        for s in 1..=(REPLAY_WINDOW_SEQNOS as u64 + 10) {
+            let m = SignedMessage::create(&id, "t", s.to_le_bytes().to_vec(), s, 1000);
+            assert!(validate(&m, &mut g, 1000).is_ok());
+        }
+        // Seqno 1 fell out of the remembered set; the floor must still reject a re-signed copy.
+        let old = SignedMessage::create(&id, "t", b"replay".to_vec(), 1, 1000);
+        assert_eq!(validate(&old, &mut g, 1000), Err(MsgError::Replay));
+        // Seqnos far behind the highest one (beyond the skew window, in µs) are stale.
+        let hi = SignedMessage::create(&id, "t", b"hi".to_vec(), 10_000_000_000, 1000);
+        assert!(validate(&hi, &mut g, 1000).is_ok());
+        let stale = SignedMessage::create(&id, "t", b"st".to_vec(), 5_000_000, 1000);
+        assert_eq!(validate(&stale, &mut g, 1000), Err(MsgError::Replay));
+    }
+
+    #[test]
+    fn restarted_sender_with_time_based_seqno_is_accepted() {
+        let id = NodeIdentity::from_seed(&[12; 32]);
+        let mut g = ReplayGuard::new(DEFAULT_SKEW_MS, 64);
+        let now_us = 1_700_000_000_000_000u64;
+        let now_ms = now_us / 1000;
+        // Previous process run published a few messages.
+        let mut last = 0;
+        for i in 0..3u8 {
+            last = next_seqno(last, now_us);
+            let m = SignedMessage::create(&id, "t", vec![i], last, now_ms);
+            assert!(validate(&m, &mut g, now_ms).is_ok());
+        }
+        // Restart: in-memory seqno state is gone (last = 0) but the clock moved on.
+        let s = next_seqno(0, now_us + 2_000_000);
+        let m = SignedMessage::create(&id, "t", b"after restart".to_vec(), s, now_ms + 2000);
+        assert!(validate(&m, &mut g, now_ms + 2000).is_ok());
+        assert!(next_seqno(5, 3) == 6 && next_seqno(5, 100) == 100);
+    }
+
+    #[test]
+    fn per_sender_state_is_bounded_and_expires() {
+        let mut g = ReplayGuard::with_limits(1000, 32, 8);
+        for i in 0..100u8 {
+            let id = NodeIdentity::from_seed(&[i; 32]);
+            let m = SignedMessage::create(&id, "t", vec![i], 1, 5000);
+            assert!(validate(&m, &mut g, 5000).is_ok());
+            assert!(g.tracked_senders() <= 8 && g.tracked_ids() <= 32);
+        }
+        // After 2·skew everything expires on the next accept.
+        let id = NodeIdentity::from_seed(&[200; 32]);
+        let m = SignedMessage::create(&id, "t", vec![1], 1, 9000);
+        assert!(validate(&m, &mut g, 9000).is_ok());
+        assert_eq!((g.tracked_senders(), g.tracked_ids()), (1, 1));
     }
 
     #[test]

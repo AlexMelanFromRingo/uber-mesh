@@ -10,7 +10,7 @@ use umesh_p2p::{MeshEvent, MeshNode};
 #[tokio::test]
 async fn two_nodes_gossip_a_validated_message() {
     // Both nodes share the same obfs PSK (the bridge secret gating the obfuscated carrier).
-    let psk = ObfsPsk([7u8; 32]);
+    let psk = ObfsPsk::new([7u8; 32]);
     let mut a = MeshNode::new(&[1u8; 32], psk.clone()).unwrap();
     let mut b = MeshNode::new(&[2u8; 32], psk).unwrap();
     let a_app_id = a.app_peer_id();
@@ -64,8 +64,8 @@ async fn two_nodes_gossip_a_validated_message() {
 /// it before any libp2p Noise upgrade (T032: the mesh inherits probe resistance).
 #[tokio::test]
 async fn mismatched_psk_cannot_connect() {
-    let mut a = MeshNode::new(&[3u8; 32], ObfsPsk([1u8; 32])).unwrap();
-    let mut b = MeshNode::new(&[4u8; 32], ObfsPsk([2u8; 32])).unwrap(); // different PSK
+    let mut a = MeshNode::new(&[3u8; 32], ObfsPsk::new([1u8; 32])).unwrap();
+    let mut b = MeshNode::new(&[4u8; 32], ObfsPsk::new([2u8; 32])).unwrap(); // different PSK
 
     a.listen("/ip4/127.0.0.1/tcp/0").unwrap();
     let a_addr = loop {

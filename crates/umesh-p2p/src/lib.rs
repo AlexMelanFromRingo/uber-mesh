@@ -5,11 +5,14 @@
 //! private Kademlia discovery + identify + ping). A high-level [`node::MeshNode`] drives the swarm —
 //! subscribe, publish signed messages, and validate inbound messages before propagation.
 //!
-//! NAT traversal (AutoNAT/Relay/DCUtR) and the obfs-transport-under-Noise integration are the next
-//! steps — see `specs/001-uber-mesh-core/contracts/libp2p-protocols.md`.
+//! The swarm runs over the obfs carrier (under Noise + Yamux) with NAT traversal (AutoNAT v2
+//! client+server, Circuit Relay v2, DCUtR), gossipsub peer scoring and connection limits — see
+//! `specs/001-uber-mesh-core/contracts/libp2p-protocols.md`. All state keyed by remote input is
+//! bounded ([`bounded`]).
 
 pub mod behaviour;
 pub mod blobs;
+pub mod bounded;
 pub mod error;
 pub mod gossip;
 pub mod metrics;
@@ -21,6 +24,6 @@ pub mod sync;
 pub use behaviour::{MeshBehaviour, build_swarm};
 pub use blobs::{BlobRequest, BlobResponse};
 pub use error::{P2pError, Result};
-pub use gossip::{MsgError, ReplayGuard, SignedMessage, validate};
+pub use gossip::{MsgError, ReplayGuard, SignedMessage, validate, validate_on_topic};
 pub use node::{MeshEvent, MeshNode};
 pub use store::ContentStore;

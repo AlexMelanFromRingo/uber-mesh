@@ -11,7 +11,7 @@ use umesh_p2p::{MeshEvent, MeshNode};
 
 #[tokio::test]
 async fn two_nodes_reconcile_content_sets() {
-    let psk = ObfsPsk([5u8; 32]);
+    let psk = ObfsPsk::new([5u8; 32]);
     let mut a = MeshNode::new(&[1u8; 32], psk.clone()).unwrap();
     let mut b = MeshNode::new(&[2u8; 32], psk).unwrap();
     let b_peer = b.local_peer_id();

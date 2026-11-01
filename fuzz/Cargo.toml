@@ -10,6 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 umesh-obfs = { path = "../crates/umesh-obfs" }
+rand = "0.8"
 umesh-p2p = { path = "../crates/umesh-p2p" }
 
 [[bin]]
@@ -22,6 +23,48 @@ bench = false
 [[bin]]
 name = "message_parse"
 path = "fuzz_targets/message_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "blob_codec"
+path = "fuzz_targets/blob_codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reconcile_codec"
+path = "fuzz_targets/reconcile_codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reconcile_respond"
+path = "fuzz_targets/reconcile_respond.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "client_hello"
+path = "fuzz_targets/client_hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_hello"
+path = "fuzz_targets/server_hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_gate"
+path = "fuzz_targets/server_gate.rs"
 test = false
 doc = false
 bench = false

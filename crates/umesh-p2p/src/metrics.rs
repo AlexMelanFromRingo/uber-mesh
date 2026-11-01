@@ -16,6 +16,10 @@ pub static GOSSIP_RECEIVED: AtomicU64 = AtomicU64::new(0);
 pub static GOSSIP_PUBLISHED: AtomicU64 = AtomicU64::new(0);
 /// Gossip messages rejected by validation (counter).
 pub static GOSSIP_REJECTED: AtomicU64 = AtomicU64::new(0);
+/// Gossip messages ignored (replay/duplicate/stale — not penalized) (counter).
+pub static GOSSIP_IGNORED: AtomicU64 = AtomicU64::new(0);
+/// Inbound blob/reconcile requests dropped by the per-peer rate limiter (counter).
+pub static REQUESTS_RATE_LIMITED: AtomicU64 = AtomicU64::new(0);
 /// Blobs served to peers (counter).
 pub static BLOBS_SERVED: AtomicU64 = AtomicU64::new(0);
 /// Blobs received + verified (counter).
@@ -99,6 +103,20 @@ pub fn render() -> String {
         "Gossip messages rejected by validation",
         "counter",
         GOSSIP_REJECTED.load(Relaxed) as i64,
+    );
+    g(
+        &mut s,
+        "umesh_gossip_ignored_total",
+        "Gossip messages ignored (replay, duplicate or stale)",
+        "counter",
+        GOSSIP_IGNORED.load(Relaxed) as i64,
+    );
+    g(
+        &mut s,
+        "umesh_requests_rate_limited_total",
+        "Inbound blob/reconcile requests dropped by the per-peer rate limiter",
+        "counter",
+        REQUESTS_RATE_LIMITED.load(Relaxed) as i64,
     );
     g(
         &mut s,

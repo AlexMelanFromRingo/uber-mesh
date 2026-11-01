@@ -17,7 +17,7 @@ use umesh_p2p::{MeshEvent, MeshNode};
 
 #[tokio::test]
 async fn connects_to_relay_node_over_obfs() {
-    let psk = ObfsPsk([6u8; 32]);
+    let psk = ObfsPsk::new([6u8; 32]);
     let mut relay = MeshNode::new(&[1u8; 32], psk.clone()).unwrap();
     let mut client = MeshNode::new(&[2u8; 32], psk).unwrap();
     let relay_peer = relay.local_peer_id();
@@ -39,11 +39,10 @@ async fn connects_to_relay_node_over_obfs() {
             tokio::select! {
                 ev = relay.next_event() => { let _ = ev; }
                 ev = client.next_event() => {
-                    if let MeshEvent::PeerConnected(p) = ev {
-                        if p == relay_peer {
+                    if let MeshEvent::PeerConnected(p) = ev
+                        && p == relay_peer {
                             return true;
                         }
-                    }
                 }
             }
         }
@@ -54,5 +53,45 @@ async fn connects_to_relay_node_over_obfs() {
         connected,
         Ok(true),
         "client should reach the relay-capable node over the obfs transport"
+    );
+}
+
+/// Audit regression (MEDIUM inert NAT): the relay had no confirmed external address, so every
+/// reservation response carried no addresses and the client rejected it. With an operator-declared
+/// (or AutoNAT-confirmed) address the reservation is accepted.
+#[tokio::test]
+async fn relay_reservation_accepted_with_confirmed_address() {
+    let psk = ObfsPsk::new([16u8; 32]);
+    let mut relay = MeshNode::new(&[11u8; 32], psk.clone()).unwrap();
+    let mut client = MeshNode::new(&[12u8; 32], psk).unwrap();
+    let relay_peer = relay.local_peer_id();
+
+    relay.listen("/ip4/127.0.0.1/tcp/0").unwrap();
+    let relay_addr = loop {
+        if let MeshEvent::Listening(a) = relay.next_event().await {
+            break a;
+        }
+    };
+    relay.add_external_address(&relay_addr.to_string()).unwrap();
+
+    client.dial(&relay_addr.to_string()).unwrap();
+    let circuit = format!("{relay_addr}/p2p/{relay_peer}/p2p-circuit");
+    client.listen(&circuit).unwrap();
+
+    let reserved = tokio::time::timeout(Duration::from_secs(20), async {
+        let mut tick = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            tokio::select! {
+                _ = relay.next_event() => {}
+                _ = client.next_event() => {}
+                _ = tick.tick() => if client.has_relay_reservation(&relay_peer) { return true; }
+            }
+        }
+    })
+    .await;
+    assert_eq!(
+        reserved,
+        Ok(true),
+        "relay should accept the client's reservation"
     );
 }
