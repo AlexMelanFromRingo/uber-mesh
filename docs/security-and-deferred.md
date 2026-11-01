@@ -108,3 +108,11 @@ policy), so each is an additive carrier behind the same seam.
 | AmneziaWG | 📐 designed; needs WireGuard core | §2.3 |
 | Local-RF blackout tier | 📐 designed; needs radio hardware | §2.4 |
 | NAT relay/hole-punch | ✅ behaviours wired; connection tested; reservation deployment-validated | `tests/nat_relay.rs` |
+
+- **Deferred — identity proof-of-work for gossip senders.** Replay protection keeps bounded state per
+  sender, and identities are free, so a sustained flood of fresh identities can overflow the exact floor
+  table; floors then fold into 4 096 hashed buckets (never dropped, so replays stay closed) and senders
+  sharing a poisoned bucket may wait up to `MAX_FUTURE_MS` (30 s). Requiring a PoW-bound sender key
+  (`umesh-crypto::pow`, already implemented and domain-separated) would price identities and close this
+  residual DoS; it is a wire/identity change and is left for a later release.
+

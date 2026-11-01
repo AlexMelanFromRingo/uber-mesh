@@ -29,9 +29,16 @@ pub const DEFAULT_SKEW_MS: u64 = 5 * 60 * 1000;
 pub const DEFAULT_DEDUP_CAP: usize = 65536;
 /// Default cap on tracked senders (per-sender replay windows).
 pub const DEFAULT_SENDER_CAP: usize = 16384;
-/// Capacity of the per-sender floor table kept for evicted sender windows (entries expire after
-/// `2·skew`, when every message they protect fails the timestamp check anyway).
+/// Capacity of the exact per-sender floor table kept for evicted sender windows (entries expire
+/// after `2·skew`, when every message they protect fails the timestamp check anyway).
 pub const DEFAULT_EVICTED_CAP: usize = 65536;
+/// Hashed fallback for floors that overflow the exact table: a live floor is never dropped, it is
+/// folded (max) into one of these buckets. Fixed memory (`8 × N` bytes).
+pub const FLOOR_BUCKETS: usize = 4096;
+/// How far in the future a message timestamp may be (the past tolerance is the full skew window).
+/// Kept small because it bounds how far above the receiver's clock any replay floor can sit, i.e.
+/// how long a future-dated flood can affect other senders sharing a fallback bucket.
+pub const MAX_FUTURE_MS: u64 = 30_000;
 /// Seqnos remembered per sender inside its replay window (out-of-order tolerance).
 pub const REPLAY_WINDOW_SEQNOS: usize = 256;
 
@@ -94,10 +101,6 @@ pub enum MsgError {
     /// The signed topic differs from the gossipsub topic the message arrived on.
     #[error("signed topic does not match delivery topic")]
     TopicMismatch,
-    /// The forwarding peer introduced too many not-yet-tracked senders too quickly (a fresh-identity
-    /// flood would otherwise churn the replay state). Not proof of malice, so only ignored.
-    #[error("new-sender rate limit exceeded for the forwarding peer")]
-    NewSenderRateLimited,
 }
 
 impl MsgError {
@@ -109,11 +112,7 @@ impl MsgError {
     pub fn is_invalid(&self) -> bool {
         !matches!(
             self,
-            MsgError::Replay
-                | MsgError::Duplicate
-                | MsgError::Timestamp
-                | MsgError::Version
-                | MsgError::NewSenderRateLimited
+            MsgError::Replay | MsgError::Duplicate | MsgError::Timestamp | MsgError::Version
         )
     }
 }
@@ -328,6 +327,8 @@ pub struct ReplayGuard {
     /// evicted). Per sender, so a sender's (possibly future-dated) timestamps only ever constrain
     /// that same sender — no global value an attacker can push above everyone's clock.
     evicted: BoundedMap<[u8; 32], (u64, u64)>,
+    /// Fallback floors for exact floors evicted while still live (see [`FLOOR_BUCKETS`]).
+    buckets: Box<[u64]>,
 }
 
 impl ReplayGuard {
@@ -343,6 +344,7 @@ impl ReplayGuard {
             seen: BoundedMap::new(dedup_cap),
             skew_ms,
             evicted: BoundedMap::new(DEFAULT_EVICTED_CAP),
+            buckets: vec![0u64; FLOOR_BUCKETS].into_boxed_slice(),
         }
     }
 
@@ -361,10 +363,36 @@ impl ReplayGuard {
         self.senders.contains_key(sender)
     }
 
+    fn bucket(sender: &[u8; 32]) -> usize {
+        // `sender` is a BLAKE3 hash, so its bytes are already uniform.
+        u32::from_le_bytes(sender[..4].try_into().expect("4 bytes")) as usize % FLOOR_BUCKETS
+    }
+
+    /// Replay floor for an untracked sender: its exact floor, else its bucket's folded floor.
+    fn floor_of(&self, sender: &[u8; 32]) -> u64 {
+        let exact = self.evicted.get(sender).map(|&(f, _)| f).unwrap_or(0);
+        exact.max(self.buckets[Self::bucket(sender)])
+    }
+
+    /// Remember an evicted window's floor; if the exact table must drop a still-live floor to make
+    /// room, fold that one into its bucket instead of losing it.
+    fn record_floor(&mut self, sender: [u8; 32], floor: u64, now_ms: u64) {
+        if !self.evicted.contains_key(&sender)
+            && self.evicted.is_full()
+            && let Some((old, (old_floor, _))) = self.evicted.pop_oldest()
+        {
+            let b = &mut self.buckets[Self::bucket(&old)];
+            *b = (*b).max(old_floor);
+        }
+        self.evicted.insert(sender, (floor, now_ms));
+    }
+
     /// Check freshness/ordering/uniqueness and, on success, record the message. Does NOT verify
     /// the signature — call [`SignedMessage::validate_stateless`] first.
     pub fn accept(&mut self, msg: &SignedMessage, now_ms: u64) -> Result<(), MsgError> {
-        if now_ms.abs_diff(msg.timestamp) > self.skew_ms {
+        if msg.timestamp > now_ms.saturating_add(MAX_FUTURE_MS)
+            || now_ms.saturating_sub(msg.timestamp) > self.skew_ms
+        {
             return Err(MsgError::Timestamp);
         }
         // Expire state that can no longer matter: a message accepted at `t` carries a timestamp
@@ -393,27 +421,24 @@ impl ReplayGuard {
         // window (or a message id) and then replay the victim's message. Drop the newcomer instead;
         // state frees itself `2·skew` later.
         // A sender we don't track may be one whose window was evicted for space: its messages up
-        // to that window's highest timestamp might be replays, so refuse them (Ignore). The floor
-        // is kept per evicted sender, so it never affects anyone else.
+        // to that window's highest timestamp might be replays, so refuse them (Ignore). Floors are
+        // exact per sender; only if that table overflows with LIVE floors is the evicted floor
+        // folded into a hashed bucket (shared with ~1/FLOOR_BUCKETS of senders) — so no floor is ever
+        // dropped (replays stay closed) and, because timestamps are capped at now + MAX_FUTURE_MS, a
+        // folded floor can delay a colliding newcomer by at most MAX_FUTURE_MS.
         if !self.senders.contains_key(&msg.sender) {
-            if self
-                .evicted
-                .get(&msg.sender)
-                .is_some_and(|&(floor, _)| msg.timestamp <= floor)
-            {
+            let floor = self.floor_of(&msg.sender);
+            if msg.timestamp <= floor {
                 return Err(MsgError::Replay);
             }
             if self.senders.is_full()
                 && let Some((k, evicted)) = self.senders.pop_oldest()
             {
-                self.evicted.insert(k, (evicted.max_ts, now_ms));
+                self.record_floor(k, evicted.max_ts, now_ms);
             }
         }
-        let inherited_floor = self
-            .evicted
-            .remove(&msg.sender)
-            .map(|(floor, _)| floor)
-            .unwrap_or(0);
+        let inherited_floor = self.floor_of(&msg.sender);
+        self.evicted.remove(&msg.sender);
         // Accept: record the seqno in the sender's window and slide it.
         let window_us = self.skew_ms.saturating_mul(1000);
         let w = self
@@ -670,7 +695,7 @@ mod tests {
         assert!(validate(&victim, &mut g, 1000).is_ok());
         // Sybil flood, FUTURE-dated by almost the whole skew window, evicts the victim's window.
         for k in 10..20u8 {
-            assert!(validate(&at(k, 1, 1000 + 59_000), &mut g, 1001 + k as u64).is_ok());
+            assert!(validate(&at(k, 1, 1000 + 29_000), &mut g, 1001 + k as u64).is_ok());
         }
         assert!(!g.tracks(&victim.sender), "premise: victim window evicted");
         // The victim's message still can't be replayed…
@@ -687,9 +712,38 @@ mod tests {
         // …and an honest newcomer at the current time is NOT locked out by the future-dated flood.
         assert!(validate(&at(50, 1, 1300), &mut g, 1300).is_ok());
         assert!(!MsgError::Replay.is_invalid(), "never penalized");
-        assert!(
-            !MsgError::NewSenderRateLimited.is_invalid(),
-            "never penalized"
+    }
+
+    /// Review round 4: even when the exact floor table overflows with live floors, no floor is
+    /// dropped (folded into a hashed bucket), so a massive fresh-identity flood still cannot replay
+    /// a victim's message.
+    #[test]
+    fn overflowing_floor_table_folds_instead_of_dropping() {
+        let mut g = ReplayGuard::with_limits(600_000, 4, 2);
+        g.evicted = BoundedMap::new(2); // tiny exact floor table to force folding
+        let at = |seed: u8, seqno: u64, ts: u64| msg(seed, seqno, ts, b"x").0;
+        let victim = at(1, 1, 1000);
+        assert!(validate(&victim, &mut g, 1000).is_ok());
+        for k in 10..60u8 {
+            let ts = 1000 + k as u64;
+            assert!(validate(&at(k, 1, ts), &mut g, ts).is_ok());
+        }
+        assert!(!g.tracks(&victim.sender) && !g.evicted.contains_key(&victim.sender));
+        assert_eq!(
+            validate(&victim, &mut g, 2000).map(|_| ()),
+            Err(MsgError::Replay)
         );
+    }
+
+    #[test]
+    fn far_future_timestamps_are_refused() {
+        let mut g = ReplayGuard::default();
+        let (m, _) = msg(3, 1, 1000 + MAX_FUTURE_MS + 1, b"x");
+        assert_eq!(
+            validate(&m, &mut g, 1000).map(|_| ()),
+            Err(MsgError::Timestamp)
+        );
+        let (ok, _) = msg(4, 1, 1000 + MAX_FUTURE_MS, b"x");
+        assert!(validate(&ok, &mut g, 1000).is_ok());
     }
 }

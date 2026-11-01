@@ -34,12 +34,6 @@ pub const RECONCILE_BURST: f64 = 32.0;
 pub const RECONCILE_RATE: f64 = 4.0;
 /// Peers tracked by each rate limiter (bounded; connection limits bound it further in practice).
 const RATE_LIMIT_PEERS: usize = 4096;
-/// Per forwarding peer: how many not-yet-tracked gossip senders it may introduce (burst / per s).
-/// Bounds how fast a fresh-identity flood can churn the replay state; honest relays introduce new
-/// authors far more slowly (a sender stays tracked for 2·skew after its last message).
-pub const NEW_SENDER_BURST: f64 = 64.0;
-/// Refill rate for [`NEW_SENDER_BURST`].
-pub const NEW_SENDER_RATE: f64 = 8.0;
 /// Max addresses taken from one peer's identify record into Kademlia.
 const MAX_IDENTIFY_ADDRS: usize = 8;
 
@@ -110,7 +104,6 @@ pub struct MeshNode {
     pending_reconcile: HashMap<OutboundRequestId, PeerId>,
     blob_limiter: RateLimiter<PeerId>,
     reconcile_limiter: RateLimiter<PeerId>,
-    new_sender_limiter: RateLimiter<PeerId>,
     relay_reservations: HashSet<PeerId>,
 }
 
@@ -142,11 +135,6 @@ impl MeshNode {
             pending_reconcile: HashMap::new(),
             blob_limiter: RateLimiter::new(BLOB_BURST_BYTES, BLOB_RATE_BYTES, RATE_LIMIT_PEERS),
             reconcile_limiter: RateLimiter::new(RECONCILE_BURST, RECONCILE_RATE, RATE_LIMIT_PEERS),
-            new_sender_limiter: RateLimiter::new(
-                NEW_SENDER_BURST,
-                NEW_SENDER_RATE,
-                RATE_LIMIT_PEERS,
-            ),
             relay_reservations: HashSet::new(),
         })
     }
@@ -316,16 +304,10 @@ impl MeshNode {
                 )) => {
                     let now = gossip::now_millis();
                     let topic = message.topic.to_string();
+                    // Verdicts depend only on the message (topic binding, signature, replay state),
+                    // never on which peer forwarded it: gossipsub caches the verdict by message-id,
+                    // so a forwarder-based Ignore would also drop honest copies from other peers.
                     let verdict = SignedMessage::decode(&message.data).and_then(|m| {
-                        if !self.guard.tracks(&m.sender)
-                            && !self.new_sender_limiter.check(
-                                propagation_source,
-                                1.0,
-                                std::time::Instant::now(),
-                            )
-                        {
-                            return Err(gossip::MsgError::NewSenderRateLimited);
-                        }
                         gossip::validate_on_topic(&m, message.topic.as_str(), &mut self.guard, now)
                             .map(|p| (m, p))
                     });

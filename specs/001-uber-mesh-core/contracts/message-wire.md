@@ -70,11 +70,16 @@ State bounds: the dedup set (default 65 536 ids) and per-sender windows (default
 seqnos each) are capacity-bounded, and entries expire `2 × skew_window` after last use (after that,
 replays of the messages they protected fail step 7 anyway). When the sender table is full, the
 least-recently-used window is evicted and its highest accepted timestamp is kept as a **per-sender floor**
-(bounded table, 65 536 entries, same `2 × skew_window` expiry). A message from that sender with
-`timestamp <= floor` is refused as `Replay` (gossipsub `Ignore`, no penalty) — also after the sender is
-tracked again. Floors are per sender, so a future-dated flood constrains only the flooding identities, never
-other senders. Additionally each forwarding peer may introduce at most 64 (burst) / 8 per second
-not-yet-tracked senders; beyond that, messages from new senders it relays are ignored
-(`NewSenderRateLimited`), which bounds how fast a fresh-identity flood can churn the replay state. The dedup set is a plain LRU cache — the per-sender windows are authoritative.
+(exact table, 65 536 entries, `2 × skew_window` expiry). If that table must drop a still-live floor, the
+floor is **folded** (max) into one of 4 096 hashed buckets instead — a floor is never lost, so a replay of an
+evicted sender's message is always refused (`Replay`, gossipsub `Ignore`, no penalty), also after the
+sender is tracked again. Message timestamps may be at most **30 s in the future** (5 min in the past), so no
+floor exceeds the receiver's clock by more than 30 s: a future-dated flood constrains only its own identities,
+plus — only once the exact table overflows — senders sharing a bucket, for at most 30 s.
+
+Verdicts depend only on the message, never on the forwarding peer: gossipsub caches a verdict by
+message-id, so a per-forwarder Ignore would also drop honest copies relayed by others. Residual risk: a
+sustained fresh-identity flood (≈135 new identities/s for 10 min) can make bucket-sharing newcomers wait up
+to 30 s; the complete fix is identity proof-of-work (deferred, see docs/security-and-deferred.md). The dedup set is a plain LRU cache — the per-sender windows are authoritative.
 
 Envelope fields use fixed-width little-endian encoding for a stable transcript (no bincode in this format).
