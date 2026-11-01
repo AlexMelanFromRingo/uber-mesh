@@ -50,7 +50,7 @@ client**. A wrong-PSK peer fails the obfs gate and never reaches Noise.
 | Identity | Ed25519 keypair; `PeerId = BLAKE3(verifying_key)`; verification uses `verify_strict`. | `identity.rs` |
 | Hashing & KDF | BLAKE3 `hash`, `derive_key(label, ikm)`, `keyed_mac(key, data)`, and `Cid` — all with **strict domain-separation labels** (one label per use: traffic keys, obfs frame/MAC, CID, PoW, …). | `hash.rs` |
 | AEAD | XChaCha20-Poly1305 (`AeadKey`, `seal`/`open`). | `aead.rs` |
-| Integrity | `rs_merkle` Merkle trees; proof-of-work. | `merkle.rs`, `pow.rs` |
+| Integrity | RFC 9162 Merkle trees with distinct leaf/node/root labels (root commits to the tree size); proof-of-work. | `merkle.rs`, `pow.rs` |
 
 The PQ half is treated as **defense-in-depth, not authority**: the classical X25519 secret is always mixed
 in, so a break of ML-KEM-768 alone cannot recover a session key. KATs (BLAKE3 empty-input, RFC 7748 §5.2
@@ -90,40 +90,45 @@ real libp2p overlay and serves Prometheus `/metrics`.
 
 ## Wire format: the obfs handshake
 
-The first flight is a **TLS 1.3 ClientHello** (record type `0x16`); the reply is a **ServerHello**. The
-hybrid key agreement is carried in a PQ-hybrid `X25519MLKEM768` `key_share` (IANA group `0x11EC`) — exactly
-the shape a modern PQ-TLS browser (Chrome/Cloudflare default since 2024) sends.
+The handshake is **obfs wire v2** (normative spec:
+[`contracts/handshake-wire.md`](specs/001-uber-mesh-core/contracts/handshake-wire.md)). On the wire it is a
+complete-looking PQ TLS 1.3 opening:
 
-| Field | Client (ClientHello) | Server (ServerHello) |
+| Flight | Wire | What it really carries |
 |---|---|---|
-| record type | `0x16` (handshake) | `0x16` (handshake) |
-| `key_share` group | `0x11EC` (X25519MLKEM768) | `0x11EC` |
-| `key_share` bytes | `ml-kem-768 ek (1184)` ‖ `x25519 pub (32)` = **1216** | `ml-kem-768 ct (1088)` ‖ `x25519 pub (32)` = **1120** |
-| `session_id` (32 B) | `epoch_le (8)` ‖ `MAC(key_share, epoch)[..24]` | echoes the client's `session_id` |
+| ClientHello (`0x16`) | Chrome-stable template: GREASE, 15 suites, full extension set shuffled per connection, GREASE ECH, per-connection cover SNI; `key_share` = `X25519MLKEM768` (`0x11EC`, 1216 B) + a decoy X25519 share | our hybrid KEM material; `session_id` = keyed MAC over the **whole** ClientHello (session_id zeroed) — 32 random-looking bytes, no cleartext epoch |
+| ServerHello + CCS + `0x17` records (2.5–5 KB) | looks like ServerHello + encrypted EncryptedExtensions/Certificate/… | `0x11EC` server share (ct 1088 ‖ x25519 32); the last 53 B of the flight = AEAD **server key confirmation** |
+| CCS + `0x17` (53 B, Finished-sized) | looks like the client Finished | AEAD **client key confirmation** |
 
-The **`session_id` is the probe-resistance gate**. The server recomputes a keyed BLAKE3 MAC over
-`(key_share, epoch)` under a PSK-derived key and compares in constant time, accepting a ±1-minute epoch
-window (clock-skew tolerant; bounds replay of a captured flight). KEM material is *public* (as in any TLS
-key_share); session confidentiality comes from the hybrid shared secret, not from hiding the key shares.
+**Gate & probe resistance.** The server checks the MAC for epochs e−1, e, e+1 in constant time and rejects
+replays via a bounded per-epoch cache. Anything that fails — non-TLS bytes, a wrong MAC, a replay — gets the
+configured probe response: silence, or a transparent reverse proxy to a real cover site that receives
+**every byte already read** (REALITY/ShadowTLS model).
+
+**Key schedule.** `transcript = H(ClientHello ‖ ServerHello)`,
+`master = KDF(ss_hybrid ‖ KDF(psk) ‖ transcript)`; confirmations, the two directional traffic keys and a
+public **channel binding** are separate labelled derivations of `master`. The client sends nothing after the
+ClientHello until the server's confirmation verifies, so a man-in-the-middle without the PSK learns nothing
+— not even that the client speaks libp2p.
 
 ```mermaid
 sequenceDiagram
     participant C as Client
     participant S as Server (PSK)
-    C->>S: ClientHello(0x16): key_share=ek‖x25519, session_id=epoch‖MAC
-    alt session_id MAC valid (PSK holder)
-        S->>C: ServerHello(0x16): key_share=ct‖x25519
-        Note over C,S: both derive directional AEAD keys from the hybrid secret
+    C->>S: ClientHello(0x16): key_share=X25519MLKEM768+x25519, session_id=MAC_psk(CH)
+    alt gate passes (PSK holder, fresh, not a replay)
+        S->>C: ServerHello + CCS + 0x17 records (server confirmation inside)
+        Note over C: abort unless the server confirmation verifies
+        C->>S: CCS + 0x17 Finished-sized (client confirmation)
         C-->>S: Application-Data (0x17) — Noise handshake, then mesh traffic
-    else gate fails (no PSK / probe / stale epoch)
-        S-->>C: silence (randomized drain + close)  —or—  reverse-proxy to a real cover site
+    else gate fails (probe / no PSK / replay)
+        S-->>C: silence  —or—  reverse-proxy every byte to a real cover site
     end
 ```
 
-Because the flow opens *ClientHello → ServerHello → application-data*, it satisfies the TLS state machine
-("a handshake precedes application data") that flagged the previous app-data-first carrier. **Residual gap:**
-this is *structurally* valid, not a byte-exact uTLS JA3/JA4 fingerprint nor a full TLS-1.3 transcript (no
-real EncryptedExtensions/Certificate/Finished) — see [`docs/security-and-deferred.md`](docs/security-and-deferred.md).
+**Residual gaps:** not a byte-exact JA3/JA4 of one specific Chrome build; the fake certificate flight would
+not survive a censor that terminates or validates TLS; no NewSessionTicket records. See
+[`docs/security-and-deferred.md`](docs/security-and-deferred.md).
 
 ### The AEAD record stream
 
@@ -164,8 +169,9 @@ gossipsub scoring); a peer without the PSK never establishes the obfs session at
 
 ## Observability
 
-Every node serves a hand-rolled Prometheus exposition endpoint (`umesh-p2p::metrics`, default `:9100/metrics`,
-`METRICS_PORT` to change, `off` to disable): connection gauges, gossip/blob/sync counters, an obfs **handshake
+Nodes can serve a hand-rolled Prometheus exposition endpoint (`umesh-p2p::metrics`). It is **off by
+default** — an unauthenticated plaintext endpoint would identify the host to a censor's scanner — and is
+enabled with `--metrics-addr` / `UMESH_METRICS_ADDR` (a bare port binds `127.0.0.1`): connection gauges, gossip/blob/sync counters, an obfs **handshake
 latency histogram**, and per-process resource metrics (`umesh_process_*` read from `/proc/self`). The
 [`docker/`](docker/) directory scales this to 100-node clusters scraped by Prometheus (DNS-SD) with a
 provisioned Grafana dashboard, under `tc-netem` impairment — see [`docs/benchmarks.md`](docs/benchmarks.md).

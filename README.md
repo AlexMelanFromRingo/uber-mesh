@@ -51,7 +51,7 @@ blocks, and verify every message end-to-end without any central authority.
 | 🕸️ **Decentralized overlay** | libp2p **Gossipsub** (Strict signing + scoring), **private Kademlia**, identify/ping, and the NAT trio (**AutoNAT v2 / Circuit Relay v2 / DCUtR**) — all running *over* the obfs carrier. |
 | ✍️ **Signed gossip + replay protection** | Ed25519-signed, content-addressed messages with monotonic seqno, timestamp window, and an LRU dedup guard. Forgeries and replays are rejected. |
 | 📦 **Content exchange & sync** | Content-addressed store + request/response blobs (`BLAKE3(bytes) == Cid`) and **negentropy-style set reconciliation**. |
-| 📈 **Observable & light** | Prometheus `/metrics` on every node + provisioned Grafana; **~4 MB RSS** per leaf node, tunable Tokio worker pool (`UMESH_WORKERS`). |
+| 📈 **Observable & light** | Opt-in, loopback-only Prometheus `/metrics` + provisioned Grafana; **~4 MB RSS** per leaf node, tunable Tokio worker pool (`UMESH_WORKERS`). |
 | 🦀 **Pure-Rust, no `unsafe`** | `unsafe_code = "deny"` workspace-wide; `#![forbid(unsafe_code)]` in the crypto core. Default build has no C/FFI. |
 
 ## Architecture
@@ -88,10 +88,12 @@ sequenceDiagram
     participant C as Client
     participant S as Server (PSK holder)
     Note over C: ephemeral X25519 + ML-KEM-768 keygen
-    C->>S: TLS ClientHello (0x16)<br/>key_share = ml-kem ek(1184) ‖ x25519(32)<br/>session_id = epoch ‖ MAC(key_share, epoch)
-    Note over S: verify session_id MAC under PSK (gate)<br/>fail ⇒ silence OR reverse-proxy to cover site
-    S->>C: TLS ServerHello (0x16)<br/>key_share = ml-kem ct(1088) ‖ x25519(32)
-    Note over C,S: derive directional AEAD keys from the hybrid shared secret
+    C->>S: TLS ClientHello (0x16), Chrome-shaped (GREASE, shuffled extensions)<br/>key_share = X25519MLKEM768 + decoy X25519<br/>session_id = MAC_psk(whole ClientHello) — looks random
+    Note over S: verify MAC (epochs e−1..e+1) + replay cache<br/>fail ⇒ silence OR forward every byte to the cover site
+    S->>C: ServerHello + CCS + "encrypted handshake" records<br/>(hidden inside: server key confirmation)
+    Note over C: verify server confirmation ⇒ server knows PSK + KEM secret
+    C->>S: CCS + Finished-sized record (client key confirmation)
+    Note over C,S: keys = KDF(hybrid secret ‖ PSK ‖ transcript), directional
     C->>S: Application-Data records (0x17) — Noise → Gossipsub …
     S->>C: Application-Data records (0x17)
 ```
@@ -113,8 +115,8 @@ git clone https://github.com/AlexMelanFromRingo/uber-mesh
 cd uber-mesh
 
 cargo build --workspace
-cargo test  --workspace        # 99 tests: KATs, property tests, DPI sim, gossip/NAT/reconcile integration
-cargo clippy --workspace --all-targets -- -D warnings
+cargo test  --workspace        # 208 tests: KATs, property tests, DPI sim, handshake attacks, gossip/NAT/reconcile
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 ### Two-node gossip mesh (obfuscated, hybrid-PQ, probe-resistant)
@@ -127,21 +129,25 @@ distributed out-of-band).
 cargo run -p uber-mesh -- --data-dir /tmp/a init      # ← copy A's PSK
 cargo run -p uber-mesh -- --data-dir /tmp/b init
 
-# Node A (bootstrap) — prints "libp2p peer: <PEER_ID>" and serves metrics on :9100/metrics
-cargo run -p uber-mesh -- --data-dir /tmp/a mesh --listen /ip4/127.0.0.1/tcp/41999 --psk <A_PSK>
+# Put A's PSK in an owner-only file (never on the command line: argv is visible in `ps`).
+(umask 077; printf '%s\n' '<A_PSK>' > /tmp/a.psk)
 
-# Node B — dials A over the obfuscated transport using A's PSK
-cargo run -p uber-mesh -- --data-dir /tmp/b mesh --listen /ip4/127.0.0.1/tcp/0 \
-    --bootstrap /ip4/127.0.0.1/tcp/41999/p2p/<A_PEER_ID> --psk <A_PSK>
+# Node A (bootstrap) — prints "libp2p peer: <PEER_ID>"; --metrics-addr opts in to a loopback /metrics
+cargo run -p uber-mesh -- --data-dir /tmp/a mesh --listen /ip4/127.0.0.1/tcp/41999 \
+    --psk-file /tmp/a.psk --metrics-addr 9100
+
+# Node B — dials A over the obfuscated transport using A's PSK (here via the environment)
+UMESH_PSK="$(cat /tmp/a.psk)" cargo run -p uber-mesh -- --data-dir /tmp/b mesh --listen /ip4/127.0.0.1/tcp/0 \
+    --bootstrap /ip4/127.0.0.1/tcp/41999/p2p/<A_PEER_ID>
 ```
 
 Each node prints `[uber-mesh/global] b3:<sender>: heartbeat …` (sender authenticated via Ed25519). A peer
-started with the **wrong `--psk` is rejected by the obfs gate and never connects**. Inspect a node without
+started with the **wrong PSK is rejected by the obfs gate and never connects**. Inspect a node without
 ever revealing secrets:
 
 ```bash
 cargo run -p uber-mesh -- --data-dir /tmp/a status --json
-curl -s localhost:9100/metrics | grep umesh_      # peers, gossip, handshake histogram, resources
+curl -s 127.0.0.1:9100/metrics | grep umesh_      # peers, gossip, handshake histogram, resources
 ```
 
 <details>
@@ -150,14 +156,34 @@ curl -s localhost:9100/metrics | grep umesh_      # peers, gossip, handshake his
 | Var | Default | Meaning |
 |---|---|---|
 | `UMESH_WORKERS` | `2` | Tokio worker threads (`1` = current-thread runtime; lower = lighter footprint). |
-| `METRICS_PORT` | `9100` | Prometheus `/metrics` port for the `mesh` command (`off` to disable). |
+| `UMESH_PSK` | — | Obfs PSK (hex) override for `run`/`mesh`. Precedence: `--psk-file` > `--psk` (deprecated) > `UMESH_PSK` > `config.toml`. |
+| `UMESH_METRICS_ADDR` | *off* | Enables `/metrics` for `mesh` (same as `--metrics-addr`): `PORT` ⇒ `127.0.0.1:PORT`, or `IP:PORT`. |
+| `METRICS_PORT` | — | **Deprecated.** If set, binds `/metrics` on `127.0.0.1:PORT` only (previously on by default on `0.0.0.0`). |
 | `UMESH_SNI` | `www.cloudflare.com` | Cover-domain SNI presented in the obfs ClientHello. |
 | `RUST_LOG` | `info` | Tracing filter (never logs secrets). |
 
 </details>
 
 Fuzz the wire parsers (nightly): `cd fuzz && cargo +nightly fuzz run obfs_record` (or `message_parse`).
-Run a 100-node Docker cluster with Prometheus + Grafana under `tc-netem`: `NODES=100 bash docker/run-cluster.sh`.
+Run a 100-node Docker cluster with Prometheus + Grafana under `tc-netem`: `NODES=100 bash docker/run-cluster.sh`
+(generates a per-run PSK and Grafana admin password; Prometheus/Grafana are published on `127.0.0.1` only).
+
+<details>
+<summary>Operational security (read before deploying)</summary>
+
+- **`/metrics` is off by default.** It is unauthenticated plaintext HTTP and its metric names identify the
+  host as an uber-mesh node, which would defeat probe resistance if a censor can reach it. Enable it only on
+  loopback (`--metrics-addr 9100`) or a private monitoring network; never on a public interface. It enforces a
+  5 s header-read timeout, an 8 KiB header cap and at most 8 concurrent connections.
+- **Pass the PSK via `--psk-file` or `UMESH_PSK`.** `--psk <HEX>` still works but logs a deprecation warning:
+  command-line arguments are readable by other local users (`ps`, `/proc/<pid>/cmdline`).
+- **On-disk secrets.** `identity.key` and `config.toml` (which holds the PSK) are created `0600`, the data
+  directory `0700`; the keystore refuses to read or write through symlinks. A mistyped `profile` in
+  `config.toml` / `--profile` is now an error instead of silently running as `moderate`.
+- **Docker.** The image runs as uid 10001; bench containers start as root only to apply `tc-netem`
+  (`NET_ADMIN`) and then drop privileges. Base images are pinned by tag + digest.
+
+</details>
 
 ## Censorship resistance
 

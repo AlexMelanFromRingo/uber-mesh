@@ -16,7 +16,7 @@ edition = "2024"
 license = "MPL-2.0"
 authors = ["uber-mesh contributors"]
 repository = "https://github.com/AlexMelanFromRingo/uber-mesh"
-rust-version = "1.85"
+rust-version = "1.88"
 
 # Default-deny unsafe across the workspace (constitution Principle IV).
 # The crypto crate additionally `#![forbid(unsafe_code)]`.
@@ -33,9 +33,7 @@ ed25519-dalek = { version = "2.2", features = ["rand_core", "zeroize"] }
 x25519-dalek = { version = "2", features = ["zeroize", "static_secrets"] }
 ml-kem = { version = "0.3", features = ["getrandom"] }
 chacha20poly1305 = { version = "0.11", features = ["alloc"] }
-rs_merkle = "1.5"
 rand = "0.8"
-lru = "0.12"
 # NB: bincode 3.0.0 is a protest/troll release that refuses to compile (compile_error!); 2.x is the
 # real, maintained line with the same Encode/Decode derive + encode_to_vec/decode_from_slice API.
 bincode = "2"

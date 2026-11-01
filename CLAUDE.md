@@ -12,6 +12,6 @@ Read these for technologies, structure, commands, and rules before working:
 - Tasks: `specs/001-uber-mesh-core/tasks.md`
 
 Stack: Rust 1.95 (edition 2024) Cargo workspace; rust-libp2p 0.56 (Tokio); crypto = ml-kem + x25519-dalek +
-ed25519-dalek + blake3 + chacha20poly1305 (XChaCha20) + rs-merkle. Default build is pure-Rust; C/FFI is
+ed25519-dalek + blake3 + chacha20poly1305 (XChaCha20); Merkle = own RFC 9162 tree (`umesh-crypto::merkle`). Default build is pure-Rust; C/FFI is
 feature-gated only. Commit each step. Tests for crypto/protocol/parser code are mandatory (Principle V).
 <!-- SPECKIT END -->

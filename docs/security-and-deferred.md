@@ -52,7 +52,10 @@ policy), so each is an additive carrier behind the same seam.
 - **Delivered — TLS-state-machine mimicry (`umesh-obfs::tls`):** the obfs handshake now rides a
   **structurally-valid TLS 1.3 ClientHello** (record type `0x16`) with a PQ-hybrid `X25519MLKEM768`
   key_share carrying the X25519 + ML-KEM-768 material, answered by a ServerHello; the PSK auth gate is a
-  keyed MAC smuggled in the 32-byte `session_id` (REALITY's short-id-in-SessionID idea). The flow therefore
+  keyed MAC smuggled in the 32-byte `session_id` (REALITY's short-id-in-SessionID idea). **Wire v2
+  (0.9.0)** adds a Chrome-shaped template (GREASE, shuffled extensions, decoy X25519 share), a full-looking
+  server flight carrying mutual key confirmation, PSK + transcript-bound keys, a MAC over the whole
+  ClientHello with no cleartext epoch, and a replay cache — see `contracts/handshake-wire.md`. The flow therefore
   opens *ClientHello → ServerHello → application-data* — a valid TLS state-machine opening that defeats the
   "handshake-must-precede-app-data" heuristic that flagged the old app-data-first carrier
   (`dpi_middlebox::obfs_passes_tls_state_machine_dpi`; `dpi_middlebox::appdata_first_flow_is_blocked_by_state_machine`

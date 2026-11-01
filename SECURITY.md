@@ -88,14 +88,16 @@ What the implementation provides today, with the crate that owns each property:
   Noise layer sits *inside* a PQ-keyed tunnel — defeating HNDL for mesh data. A break of ML-KEM-768
   alone cannot compromise a session because the classical X25519 half remains authoritative.
   (Constitution Principle I.)
-- **Probe resistance / authenticated handshake.** The v0.8.0 obfs carrier rides a structurally-valid
-  TLS 1.3 ClientHello → ServerHello → application-data exchange (`umesh-obfs::tls`). Authentication
-  and probe-resistance are gated by a **keyed BLAKE3 MAC smuggled in the 32-byte TLS `session_id`**
-  (`epoch || MAC(key_share, epoch)`, verified in constant time, ±1-minute epoch window). A peer
-  without the shared PSK fails the gate and gets either **silence** (obfs4 model: randomized drain
-  delay, no distinguishing reply) or a **transparent reverse-proxy to a real cover site**
-  (`ProbeResponse::Fallback`, REALITY model). The cover SNI defaults to `www.cloudflare.com` and is
-  overridable via `UMESH_SNI`.
+- **Probe resistance / mutually authenticated handshake (obfs wire v2).** The carrier rides a
+  Chrome-shaped TLS 1.3 opening — ClientHello, ServerHello + CCS + "encrypted handshake" records, a
+  Finished-sized client record — see `contracts/handshake-wire.md`. The 32-byte `session_id` is a
+  keyed BLAKE3 MAC over the **whole** ClientHello (no cleartext epoch; epochs e−1..e+1 tried in
+  constant time) with a bounded replay cache. Session keys derive from the hybrid KEM secret **and**
+  the PSK **and** the transcript, and both sides prove them (key confirmation) before any data flows,
+  so an on-path party without the PSK can neither impersonate a bridge nor read anything. A peer that
+  fails the gate (no PSK, replay, non-TLS bytes) gets **silence** or a **transparent reverse-proxy to a
+  real cover site** that receives every byte already read (`--fallback` / `UMESH_FALLBACK`). The cover
+  SNI is chosen per connection (list overridable via `UMESH_SNI`).
 - **Signed, content-addressed gossip with replay protection.** Gossip messages are Ed25519-signed and
   bound to `(topic, sender PeerId, sender_key, seqno, timestamp, payload_hash)`. Validation is
   stateless signature + payload-hash checks plus a stateful **replay guard**: monotonic per-sender
@@ -107,16 +109,29 @@ What the implementation provides today, with the crate that owns each property:
   authority, no registry.
 - **No secret leakage + zeroization.** Secret material (PSK, identity seed, session keys) is
   zeroized on drop and never written to logs or status output — `NodeStatus`, errors, and metrics
-  expose only fingerprints (e.g. `psk_fingerprint = BLAKE3(psk)[..6]`). On-disk secrets are `0600`
-  files (`umesh-node::keystore`).
+  expose only fingerprints (e.g. `psk_fingerprint = BLAKE3(psk)[..6]`). On-disk secrets
+  (`identity.key`, `config.toml`) are created atomically as `0600` files (`O_CREAT|O_EXCL`, never
+  through a symlink) in a `0700` data directory (`umesh-node::{keystore,config}`). The PSK is taken
+  from `--psk-file` / `UMESH_PSK`; `--psk` on argv is deprecated because argv is world-readable.
+- **Session-bound peer hello.** The node-level hello (`umesh-node::node`, v2) is a challenge-response:
+  each side signs `label ‖ role ‖ own_vk ‖ peer_vk ‖ own_challenge ‖ peer_challenge` over fresh
+  per-session challenges, so a recorded hello cannot be replayed by another PSK holder to impersonate a
+  node, and the exchange is bounded by a timeout.
+- **Operational surface.** The Prometheus `/metrics` endpoint is **off by default** and binds
+  loopback unless an explicit IP is given, because its plaintext metric names would identify the host to
+  a scanning censor. When enabled it has a header-read timeout, header-size cap, and a connection cap.
+  The Docker harness runs nodes as an unprivileged user, publishes Prometheus/Grafana on `127.0.0.1`
+  only, has no anonymous Grafana access, and pins images by digest.
 - **Memory safety, default-deny unsafe.** The whole workspace is `unsafe_code = "deny"`, and the
   cryptographic core (`umesh-crypto`) is `#![forbid(unsafe_code)]` — zero unsafe. Pure-Rust by
   default; any C/FFI is feature-gated. (Constitution Principle IV.)
 - **Test-first crypto/protocol/parser verification.** Crypto and wire parsers ship with unit tests,
   known-answer tests (BLAKE3 empty-input, RFC 7748 §5.2 X25519, hybrid-KEM agreement), property tests
   (AEAD round-trip + bit-flip detection, CID determinism, Merkle membership), and DPI/censor
-  simulation tests. CI enforces `cargo fmt`, `clippy -D warnings`, build, the full test suite, and
-  `cargo-deny` (advisories/bans/licenses/sources). (Constitution Principle V.)
+  simulation tests. CI enforces `cargo fmt`, `clippy -D warnings`, build, the full test suite,
+  `cargo-deny` (advisories/bans/licenses/sources), `cargo audit --deny warnings`, and a fuzz smoke run
+  of every harness in `fuzz/fuzz_targets`; all actions are pinned to commit SHAs with a read-only
+  token. (Constitution Principles V & VII.)
 
 ## Known Limitations & Residual Gaps
 
@@ -130,6 +145,9 @@ We document gaps rather than paper over them. Full disposition and rationale:
   EncryptedExtensions/Certificate/Finished). A DPI engine performing full-transcript validation could
   still distinguish it. Closing this requires a real ClientHello-controlling TLS stack and Go-Xray
   interop testing, and is **deferred behind a future `reality` feature flag.**
+- **Node hello has no channel binding yet.** The v2 hello defeats replay, but the obfs layer does not
+  export a handshake transcript hash to bind it to, so a PSK-holding cohort member that actively relays
+  a *live* session between two honest nodes is not detected at this layer.
 - **Pre-audit cryptography.** As stated in the warning above, the PQ crate and the stack are
   unaudited.
 - **Deferred carriers.** QUIC + Salamander, AmneziaWG, and a local-RF blackout tier are *designed but
