@@ -69,11 +69,12 @@ P4); **Ignore** = not propagated, *not* penalized (an honest peer can relay it, 
 State bounds: the dedup set (default 65 536 ids) and per-sender windows (default 16 384 senders, ≤ 256
 seqnos each) are capacity-bounded, and entries expire `2 × skew_window` after last use (after that,
 replays of the messages they protected fail step 7 anyway). When the sender table is full, the
-least-recently-used window is evicted and the guard raises an **eviction floor** to that window's highest
-accepted timestamp. A message from a sender with no window — and any message in a window created after an
-eviction — whose `timestamp <= floor` is refused as `Replay` (gossipsub `Ignore`, no penalty). So a flood of
-fresh identities can neither re-open a replay of an evicted victim's message nor lock out honest senders,
-whose current-clock timestamps sit above the floor (it trails `now` by the table's turnover time). Senders
-still tracked are unaffected. The dedup set is a plain LRU cache — the per-sender windows are authoritative.
+least-recently-used window is evicted and its highest accepted timestamp is kept as a **per-sender floor**
+(bounded table, 65 536 entries, same `2 × skew_window` expiry). A message from that sender with
+`timestamp <= floor` is refused as `Replay` (gossipsub `Ignore`, no penalty) — also after the sender is
+tracked again. Floors are per sender, so a future-dated flood constrains only the flooding identities, never
+other senders. Additionally each forwarding peer may introduce at most 64 (burst) / 8 per second
+not-yet-tracked senders; beyond that, messages from new senders it relays are ignored
+(`NewSenderRateLimited`), which bounds how fast a fresh-identity flood can churn the replay state. The dedup set is a plain LRU cache — the per-sender windows are authoritative.
 
 Envelope fields use fixed-width little-endian encoding for a stable transcript (no bincode in this format).

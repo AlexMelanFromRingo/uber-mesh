@@ -29,6 +29,9 @@ pub const DEFAULT_SKEW_MS: u64 = 5 * 60 * 1000;
 pub const DEFAULT_DEDUP_CAP: usize = 65536;
 /// Default cap on tracked senders (per-sender replay windows).
 pub const DEFAULT_SENDER_CAP: usize = 16384;
+/// Capacity of the per-sender floor table kept for evicted sender windows (entries expire after
+/// `2·skew`, when every message they protect fails the timestamp check anyway).
+pub const DEFAULT_EVICTED_CAP: usize = 65536;
 /// Seqnos remembered per sender inside its replay window (out-of-order tolerance).
 pub const REPLAY_WINDOW_SEQNOS: usize = 256;
 
@@ -91,6 +94,10 @@ pub enum MsgError {
     /// The signed topic differs from the gossipsub topic the message arrived on.
     #[error("signed topic does not match delivery topic")]
     TopicMismatch,
+    /// The forwarding peer introduced too many not-yet-tracked senders too quickly (a fresh-identity
+    /// flood would otherwise churn the replay state). Not proof of malice, so only ignored.
+    #[error("new-sender rate limit exceeded for the forwarding peer")]
+    NewSenderRateLimited,
 }
 
 impl MsgError {
@@ -102,7 +109,11 @@ impl MsgError {
     pub fn is_invalid(&self) -> bool {
         !matches!(
             self,
-            MsgError::Replay | MsgError::Duplicate | MsgError::Timestamp | MsgError::Version
+            MsgError::Replay
+                | MsgError::Duplicate
+                | MsgError::Timestamp
+                | MsgError::Version
+                | MsgError::NewSenderRateLimited
         )
     }
 }
@@ -301,8 +312,8 @@ struct SenderWindow {
     last_ms: u64,
     /// Highest message timestamp accepted from this sender (feeds the eviction floor).
     max_ts: u64,
-    /// The guard's eviction floor when this window was created: this sender's window may have been
-    /// evicted before, so its messages at or below this timestamp may be replays — refuse them.
+    /// This sender's floor from an earlier evicted window (0 if none): its messages at or below
+    /// this timestamp may be replays of what the evicted window protected — refuse them.
     ts_floor: u64,
 }
 
@@ -313,8 +324,10 @@ pub struct ReplayGuard {
     senders: BoundedMap<[u8; 32], SenderWindow>,
     seen: BoundedMap<Hash32, u64>,
     skew_ms: u64,
-    /// Max message timestamp of any sender window evicted for space (see `accept`).
-    evicted_ts_floor: u64,
+    /// Floors of sender windows evicted for space: sender → (highest accepted timestamp, when it was
+    /// evicted). Per sender, so a sender's (possibly future-dated) timestamps only ever constrain
+    /// that same sender — no global value an attacker can push above everyone's clock.
+    evicted: BoundedMap<[u8; 32], (u64, u64)>,
 }
 
 impl ReplayGuard {
@@ -329,7 +342,7 @@ impl ReplayGuard {
             senders: BoundedMap::new(sender_cap),
             seen: BoundedMap::new(dedup_cap),
             skew_ms,
-            evicted_ts_floor: 0,
+            evicted: BoundedMap::new(DEFAULT_EVICTED_CAP),
         }
     }
 
@@ -341,6 +354,11 @@ impl ReplayGuard {
     /// Number of message-ids currently remembered (bounded by the dedup cap).
     pub fn tracked_ids(&self) -> usize {
         self.seen.len()
+    }
+
+    /// Whether `sender` currently has a replay window (a message from an untracked sender creates one).
+    pub fn tracks(&self, sender: &[u8; 32]) -> bool {
+        self.senders.contains_key(sender)
     }
 
     /// Check freshness/ordering/uniqueness and, on success, record the message. Does NOT verify
@@ -356,6 +374,8 @@ impl ReplayGuard {
             .expire_oldest_while(|&t| now_ms.saturating_sub(t) > retain);
         self.senders
             .expire_oldest_while(|w| now_ms.saturating_sub(w.last_ms) > retain);
+        self.evicted
+            .expire_oldest_while(|&(_, at)| now_ms.saturating_sub(at) > retain);
 
         let id = msg.message_id();
         if self.seen.contains_key(&id) {
@@ -373,22 +393,27 @@ impl ReplayGuard {
         // window (or a message id) and then replay the victim's message. Drop the newcomer instead;
         // state frees itself `2·skew` later.
         // A sender we don't track may be one whose window was evicted for space: its messages up
-        // to the eviction floor might be replays, so refuse them (Ignore). Honest newcomers write
-        // with their current clock and land above the floor, which trails `now` by the eviction
-        // turnover time; senders still tracked are unaffected. This keeps memory bounded without
-        // either re-opening replays (plain LRU) or refusing all new traffic when full (fail-closed).
+        // to that window's highest timestamp might be replays, so refuse them (Ignore). The floor
+        // is kept per evicted sender, so it never affects anyone else.
         if !self.senders.contains_key(&msg.sender) {
-            if msg.timestamp <= self.evicted_ts_floor {
+            if self
+                .evicted
+                .get(&msg.sender)
+                .is_some_and(|&(floor, _)| msg.timestamp <= floor)
+            {
                 return Err(MsgError::Replay);
             }
             if self.senders.is_full()
-                && let Some((_, evicted)) = self.senders.pop_oldest()
+                && let Some((k, evicted)) = self.senders.pop_oldest()
             {
-                self.evicted_ts_floor = self.evicted_ts_floor.max(evicted.max_ts);
+                self.evicted.insert(k, (evicted.max_ts, now_ms));
             }
         }
-
-        let inherited_floor = self.evicted_ts_floor;
+        let inherited_floor = self
+            .evicted
+            .remove(&msg.sender)
+            .map(|(floor, _)| floor)
+            .unwrap_or(0);
         // Accept: record the seqno in the sender's window and slide it.
         let window_us = self.skew_ms.saturating_mul(1000);
         let w = self
@@ -632,39 +657,39 @@ mod tests {
         assert!(SignedMessage::decode(&[0xff; 4]).is_err());
         assert!(SignedMessage::decode(&[1, 0, 0]).is_err()); // version ok, truncated
     }
-    /// Regression: a flood of fresh identities used to evict a victim's replay window (LRU), after
-    /// which the victim's message could be replayed. A first fix refused ALL new traffic once the
-    /// state was full (a DoS). Now: eviction raises a timestamp floor for untracked senders —
-    /// the victim's replay is refused, and honest senders writing with a current clock (newcomers
-    /// or ones whose window was evicted) still get through.
+    /// Regression (two review rounds): (1) a fresh-identity flood used to LRU-evict a victim's replay
+    /// window and replay its message; (2) a global eviction floor let future-dated attacker messages
+    /// lock out every newcomer. Floors are now per evicted sender: the victim stays unreplayable,
+    /// while a future-dated flood constrains only the flooding identities themselves.
     #[test]
-    fn eviction_floor_blocks_replays_without_blocking_newcomers() {
-        // Tiny dedup set too, so the victim's message-id is also gone and only the floor protects.
+    fn per_sender_eviction_floor_blocks_replays_without_global_lockout() {
+        // Tiny dedup set too, so the victim's message-id is gone and only the floor protects.
         let mut g = ReplayGuard::with_limits(60_000, 4, 4);
         let at = |seed: u8, seqno: u64, ts: u64| msg(seed, seqno, ts, b"x").0;
         let victim = at(1, 1, 1000);
         assert!(validate(&victim, &mut g, 1000).is_ok());
-        let tracked = 2u8;
-        assert!(validate(&at(tracked, 1, 1001), &mut g, 1001).is_ok());
-        // Sybil flood with fresh identities evicts the victim's window.
+        // Sybil flood, FUTURE-dated by almost the whole skew window, evicts the victim's window.
         for k in 10..20u8 {
-            let ts = 1002 + k as u64;
-            assert!(
-                validate(&at(k, 1, ts), &mut g, ts).is_ok(),
-                "flood messages still accepted"
-            );
+            assert!(validate(&at(k, 1, 1000 + 59_000), &mut g, 1001 + k as u64).is_ok());
         }
-        // The victim's message can't be replayed even though its window is gone…
-        assert!(matches!(
-            validate(&victim, &mut g, 1003),
-            Err(MsgError::Replay | MsgError::Duplicate)
-        ));
-        // …an honest newcomer writing with a current clock is accepted…
-        assert!(validate(&at(50, 1, 1500), &mut g, 1500).is_ok());
-        // …and a sender whose window was pushed out keeps working with fresh messages, while its
-        // own old message stays unreplayable.
-        assert!(validate(&at(tracked, 2, 1600), &mut g, 1600).is_ok());
-        assert!(validate(&at(tracked, 1, 1001), &mut g, 1601).is_err());
+        assert!(!g.tracks(&victim.sender), "premise: victim window evicted");
+        // The victim's message still can't be replayed…
+        assert_eq!(
+            validate(&victim, &mut g, 1100).map(|_| ()),
+            Err(MsgError::Replay)
+        );
+        // …its old message stays refused even after it is tracked again with a fresh message…
+        assert!(validate(&at(1, 2, 1200), &mut g, 1200).is_ok());
+        assert_eq!(
+            validate(&victim, &mut g, 1201).map(|_| ()),
+            Err(MsgError::Replay)
+        );
+        // …and an honest newcomer at the current time is NOT locked out by the future-dated flood.
+        assert!(validate(&at(50, 1, 1300), &mut g, 1300).is_ok());
         assert!(!MsgError::Replay.is_invalid(), "never penalized");
+        assert!(
+            !MsgError::NewSenderRateLimited.is_invalid(),
+            "never penalized"
+        );
     }
 }
