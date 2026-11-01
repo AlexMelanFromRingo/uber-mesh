@@ -91,10 +91,6 @@ pub enum MsgError {
     /// The signed topic differs from the gossipsub topic the message arrived on.
     #[error("signed topic does not match delivery topic")]
     TopicMismatch,
-    /// Replay state is full of still-live entries; the message is dropped rather than evicting a
-    /// live replay window (fail closed). Not the sender's fault, so only ignored.
-    #[error("replay state saturated")]
-    Saturated,
 }
 
 impl MsgError {
@@ -106,11 +102,7 @@ impl MsgError {
     pub fn is_invalid(&self) -> bool {
         !matches!(
             self,
-            MsgError::Replay
-                | MsgError::Duplicate
-                | MsgError::Timestamp
-                | MsgError::Version
-                | MsgError::Saturated
+            MsgError::Replay | MsgError::Duplicate | MsgError::Timestamp | MsgError::Version
         )
     }
 }
@@ -307,6 +299,11 @@ struct SenderWindow {
     high: u64,
     recent: BTreeSet<u64>,
     last_ms: u64,
+    /// Highest message timestamp accepted from this sender (feeds the eviction floor).
+    max_ts: u64,
+    /// The guard's eviction floor when this window was created: this sender's window may have been
+    /// evicted before, so its messages at or below this timestamp may be replays — refuse them.
+    ts_floor: u64,
 }
 
 /// Stateful anti-replay: per-sender sliding seqno window, timestamp window, bounded message-id
@@ -316,6 +313,8 @@ pub struct ReplayGuard {
     senders: BoundedMap<[u8; 32], SenderWindow>,
     seen: BoundedMap<Hash32, u64>,
     skew_ms: u64,
+    /// Max message timestamp of any sender window evicted for space (see `accept`).
+    evicted_ts_floor: u64,
 }
 
 impl ReplayGuard {
@@ -330,6 +329,7 @@ impl ReplayGuard {
             senders: BoundedMap::new(sender_cap),
             seen: BoundedMap::new(dedup_cap),
             skew_ms,
+            evicted_ts_floor: 0,
         }
     }
 
@@ -362,7 +362,9 @@ impl ReplayGuard {
             return Err(MsgError::Duplicate);
         }
         if let Some(w) = self.senders.get(&msg.sender)
-            && (msg.seqno <= w.floor || w.recent.contains(&msg.seqno))
+            && (msg.seqno <= w.floor
+                || w.recent.contains(&msg.seqno)
+                || msg.timestamp <= w.ts_floor)
         {
             return Err(MsgError::Replay);
         }
@@ -370,12 +372,23 @@ impl ReplayGuard {
         // Evicting it to make room would let a flood of fresh identities push out a victim's
         // window (or a message id) and then replay the victim's message. Drop the newcomer instead;
         // state frees itself `2·skew` later.
-        if (!self.senders.contains_key(&msg.sender) && self.senders.is_full())
-            || self.seen.is_full()
-        {
-            return Err(MsgError::Saturated);
+        // A sender we don't track may be one whose window was evicted for space: its messages up
+        // to the eviction floor might be replays, so refuse them (Ignore). Honest newcomers write
+        // with their current clock and land above the floor, which trails `now` by the eviction
+        // turnover time; senders still tracked are unaffected. This keeps memory bounded without
+        // either re-opening replays (plain LRU) or refusing all new traffic when full (fail-closed).
+        if !self.senders.contains_key(&msg.sender) {
+            if msg.timestamp <= self.evicted_ts_floor {
+                return Err(MsgError::Replay);
+            }
+            if self.senders.is_full()
+                && let Some((_, evicted)) = self.senders.pop_oldest()
+            {
+                self.evicted_ts_floor = self.evicted_ts_floor.max(evicted.max_ts);
+            }
         }
 
+        let inherited_floor = self.evicted_ts_floor;
         // Accept: record the seqno in the sender's window and slide it.
         let window_us = self.skew_ms.saturating_mul(1000);
         let w = self
@@ -385,8 +398,11 @@ impl ReplayGuard {
                 high: 0,
                 recent: BTreeSet::new(),
                 last_ms: now_ms,
+                max_ts: 0,
+                ts_floor: inherited_floor,
             });
         w.last_ms = now_ms;
+        w.max_ts = w.max_ts.max(msg.timestamp);
         w.recent.insert(msg.seqno);
         w.high = w.high.max(msg.seqno);
         let slide_to = w.high.saturating_sub(window_us);
@@ -599,15 +615,8 @@ mod tests {
         let mut g = ReplayGuard::with_limits(1000, 32, 8);
         for i in 0..100u8 {
             let id = NodeIdentity::from_seed(&[i; 32]);
-            let m = SignedMessage::create(&id, "t", vec![i], 1, 5000);
-            // The first 8 senders fit; the rest are dropped (fail closed), never evicting a live
-            // replay window.
-            let r = validate(&m, &mut g, 5000);
-            if i < 8 {
-                assert!(r.is_ok());
-            } else {
-                assert_eq!(r.map(|_| ()), Err(MsgError::Saturated));
-            }
+            let m = SignedMessage::create(&id, "t", vec![i], 1, 5000 + i as u64);
+            assert!(validate(&m, &mut g, 5000).is_ok());
             assert!(g.tracked_senders() <= 8 && g.tracked_ids() <= 32);
         }
         // After 2·skew everything expires on the next accept.
@@ -624,31 +633,38 @@ mod tests {
         assert!(SignedMessage::decode(&[1, 0, 0]).is_err()); // version ok, truncated
     }
     /// Regression: a flood of fresh identities used to evict a victim's replay window (LRU), after
-    /// which the victim's message could be replayed. Now the guard fails closed instead.
+    /// which the victim's message could be replayed. A first fix refused ALL new traffic once the
+    /// state was full (a DoS). Now: eviction raises a timestamp floor for untracked senders —
+    /// the victim's replay is refused, and honest senders writing with a current clock (newcomers
+    /// or ones whose window was evicted) still get through.
     #[test]
-    fn full_replay_state_fails_closed_instead_of_evicting() {
-        let mut g = ReplayGuard::with_limits(60_000, 1024, 4);
-        let msg_from = |seed: u8, seqno: u64, ts: u64| msg(seed, seqno, ts, b"x").0;
-        let victim = msg_from(1, 1, 1000);
-        assert_eq!(validate(&victim, &mut g, 1000).map(|_| ()), Ok(()));
-        for k in 2..=4u8 {
-            assert!(validate(&msg_from(k, 1, 1000), &mut g, 1000).is_ok());
+    fn eviction_floor_blocks_replays_without_blocking_newcomers() {
+        // Tiny dedup set too, so the victim's message-id is also gone and only the floor protects.
+        let mut g = ReplayGuard::with_limits(60_000, 4, 4);
+        let at = |seed: u8, seqno: u64, ts: u64| msg(seed, seqno, ts, b"x").0;
+        let victim = at(1, 1, 1000);
+        assert!(validate(&victim, &mut g, 1000).is_ok());
+        let tracked = 2u8;
+        assert!(validate(&at(tracked, 1, 1001), &mut g, 1001).is_ok());
+        // Sybil flood with fresh identities evicts the victim's window.
+        for k in 10..20u8 {
+            let ts = 1002 + k as u64;
+            assert!(
+                validate(&at(k, 1, ts), &mut g, ts).is_ok(),
+                "flood messages still accepted"
+            );
         }
-        // A fifth fresh sender cannot push the victim's window out…
-        assert_eq!(
-            validate(&msg_from(5, 1, 1000), &mut g, 1000).map(|_| ()),
-            Err(MsgError::Saturated)
-        );
-        assert!(
-            !MsgError::Saturated.is_invalid(),
-            "saturation is not the sender's fault"
-        );
-        // …so the victim's message is still recognised as a replay.
+        // The victim's message can't be replayed even though its window is gone…
         assert!(matches!(
-            validate(&victim, &mut g, 1001),
+            validate(&victim, &mut g, 1003),
             Err(MsgError::Replay | MsgError::Duplicate)
         ));
-        // Once the old state expires (2·skew), new senders are admitted again.
-        assert!(validate(&msg_from(5, 1, 130_001), &mut g, 130_001).is_ok());
+        // …an honest newcomer writing with a current clock is accepted…
+        assert!(validate(&at(50, 1, 1500), &mut g, 1500).is_ok());
+        // …and a sender whose window was pushed out keeps working with fresh messages, while its
+        // own old message stays unreplayable.
+        assert!(validate(&at(tracked, 2, 1600), &mut g, 1600).is_ok());
+        assert!(validate(&at(tracked, 1, 1001), &mut g, 1601).is_err());
+        assert!(!MsgError::Replay.is_invalid(), "never penalized");
     }
 }

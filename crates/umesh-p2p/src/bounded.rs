@@ -84,6 +84,17 @@ impl<K: Hash + Eq + Clone, V> BoundedMap<K, V> {
         &mut self.map.get_mut(&k).expect("just inserted").0
     }
 
+    /// Remove and return the least-recently-touched entry.
+    pub fn pop_oldest(&mut self) -> Option<(K, V)> {
+        while let Some((k, g)) = self.order.pop_front() {
+            if self.map.get(&k).is_some_and(|(_, cur)| *cur == g) {
+                let (v, _) = self.map.remove(&k).expect("checked above");
+                return Some((k, v));
+            }
+        }
+        None
+    }
+
     /// Remove `k`.
     pub fn remove(&mut self, k: &K) -> Option<V> {
         self.map.remove(k).map(|(v, _)| v)
