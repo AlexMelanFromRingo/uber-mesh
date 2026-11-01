@@ -17,13 +17,6 @@ ignore = [
     # `paste` (proc-macro) is unmaintained but is a transitive dep pulled by the crypto stack, has no
     # known vulnerability, and runs only at compile time. No drop-in replacement is pulled by our deps.
     "RUSTSEC-2024-0436",
-    # hickory-proto 0.25.2 (DNSSEC NSEC3 loop; O(n²) name compression) is NOT compiled into any
-    # uber-mesh binary: it sits in Cargo.lock only because libp2p's `tokio` feature names
-    # `libp2p-mdns?/tokio` / `libp2p-dns?/tokio` (weak deps lock optional crates even when off —
-    # rust-lang/cargo#10801). We enable neither mdns nor dns. CI's `deps-not-built` guard fails if
-    # hickory-proto ever enters the real build graph, at which point these ignores must go.
-    "RUSTSEC-2026-0118",
-    "RUSTSEC-2026-0119",
 ]
 
 [licenses]

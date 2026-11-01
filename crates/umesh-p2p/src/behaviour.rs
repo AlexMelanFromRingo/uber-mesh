@@ -13,13 +13,14 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
-use libp2p::core::transport::Transport as _;
 use libp2p::core::upgrade::Version;
 use libp2p::core::{ConnectedPoint, Endpoint};
 use libp2p::kad::store::MemoryStore;
 use libp2p::swarm::NetworkBehaviour;
+use libp2p::core::muxing::StreamMuxerBox;
+use libp2p::core::transport::timeout::TransportTimeout;
 use libp2p::{
-    StreamProtocol, Swarm, SwarmBuilder, autonat, connection_limits, dcutr, gossipsub, identify,
+    StreamProtocol, Swarm, Transport, autonat, connection_limits, dcutr, gossipsub, identify,
     identity, kad, noise, ping, relay, request_response, tcp, yamux,
 };
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
@@ -246,11 +247,15 @@ pub fn build_swarm(
     let keypair =
         identity::Keypair::ed25519_from_bytes(*seed).map_err(|e| P2pError::Init(e.to_string()))?;
 
-    let swarm = SwarmBuilder::with_existing_identity(keypair)
-        .with_tokio()
-        .with_other_transport(move |keypair| {
-            let noise = noise::Config::new(keypair)?;
-            let transport = tcp::tokio::Transport::new(tcp::Config::default())
+    // Assembled by hand rather than with `SwarmBuilder::with_tokio()`: that needs libp2p's umbrella
+    // `tokio` feature, whose weak `libp2p-{mdns,dns,quic,upnp}?/tokio` entries pull those (unused)
+    // crates — and hickory-proto with its advisories — into Cargo.lock. This is exactly what the
+    // builder does: obfs-TCP or relay transport → TransportTimeout(10 s) → tokio-executor Swarm.
+    let init = |e: Box<dyn std::error::Error + Send + Sync>| P2pError::Init(e.to_string());
+    let local_peer_id = keypair.public().to_peer_id();
+    let obfs_tcp = {
+            let noise = noise::Config::new(&keypair).map_err(|e| init(e.into()))?;
+            tcp::tokio::Transport::new(tcp::Config::default())
                 .and_then(move |conn, point| {
                     let psk = psk.clone();
                     let probe = probe.clone();
@@ -284,18 +289,31 @@ pub fn build_swarm(
                 })
                 .upgrade(Version::V1)
                 .authenticate(noise)
-                .multiplex(yamux::Config::default());
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(transport)
-        })
-        .map_err(|e| P2pError::Init(e.to_string()))?
-        .with_relay_client(noise::Config::new, yamux::Config::default)
-        .map_err(|e| P2pError::Init(e.to_string()))?
-        .with_behaviour(build_behaviour)
-        .map_err(|e| P2pError::Init(e.to_string()))?
-        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
-        .build();
-    Ok(swarm)
+                .multiplex(yamux::Config::default())
+                .map(|(peer, conn), _| (peer, StreamMuxerBox::new(conn)))
+    };
+    let (relay_transport, relay_behaviour) = relay::client::new(local_peer_id);
+    let relay_transport = relay_transport
+        .upgrade(Version::V1Lazy)
+        .authenticate(noise::Config::new(&keypair).map_err(|e| init(e.into()))?)
+        .multiplex(yamux::Config::default())
+        .map(|(peer, conn), _| (peer, StreamMuxerBox::new(conn)));
+    let transport = relay_transport
+        .or_transport(obfs_tcp)
+        .map(|either, _| either.into_inner());
+    let transport = TransportTimeout::new(transport, CONNECTION_TIMEOUT).boxed();
+    let behaviour = build_behaviour(&keypair, relay_behaviour).map_err(init)?;
+    Ok(Swarm::new(
+        transport,
+        behaviour,
+        local_peer_id,
+        libp2p::swarm::Config::with_tokio_executor()
+            .with_idle_connection_timeout(Duration::from_secs(60)),
+    ))
 }
+
+/// Upper bound on one connection upgrade (obfs handshake + Noise + Yamux), as libp2p's builder.
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Wrap a handshaked carrier in the obfs byte stream with the profile's shaping policy (record
 /// padding + write coalescing). Interoperates with unshaped peers: the receiver strips padding.

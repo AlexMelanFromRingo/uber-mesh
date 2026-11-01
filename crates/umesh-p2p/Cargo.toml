@@ -18,8 +18,12 @@ bincode.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 futures.workspace = true
+# NOT libp2p's umbrella "tokio" feature: it names `libp2p-{mdns,dns,quic,upnp}?/tokio`, and weak
+# dependency features put those crates (hickory-proto, quinn, rcgen/time…) into Cargo.lock even
+# though we never build them. Enable tokio directly on the two sub-crates we use instead.
+libp2p-swarm = { version = "0.47", features = ["tokio"] }
+libp2p-tcp = { version = "0.44", features = ["tokio"] }
 libp2p = { version = "0.56", features = [
-    "tokio",
     "gossipsub",
     "identify",
     "ping",
