@@ -50,7 +50,7 @@ uber-mesh is **pre-1.0** and moves fast; the API and wire formats are not yet st
 
 | Version | Supported |
 |---|---|
-| Latest tagged release (currently **v0.8.0**) | ✅ Security fixes land here |
+| Latest tagged release (currently **v0.9.0**) | ✅ Security fixes land here |
 | Any older tag | ❌ Not supported — upgrade to the latest tag |
 | `main` between tags | ⚠️ Best-effort only |
 

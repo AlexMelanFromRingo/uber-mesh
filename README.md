@@ -115,7 +115,7 @@ git clone https://github.com/AlexMelanFromRingo/uber-mesh
 cd uber-mesh
 
 cargo build --workspace
-cargo test  --workspace        # 208 tests: KATs, property tests, DPI sim, handshake attacks, gossip/NAT/reconcile
+cargo test  --workspace        # 213 tests: KATs, property tests, DPI sim, handshake attacks, gossip/NAT/reconcile
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 

@@ -8,7 +8,9 @@ All notable changes to **uber-mesh** are documented here. The format is loosely 
 > step by step; see [`specs/001-uber-mesh-core/tasks.md`](specs/001-uber-mesh-core/tasks.md) for the
 > task-level history and [`docs/`](docs/) for design rationale.
 
-## [Unreleased] — audit 2026-11 (ships as 0.9.0; **wire-breaking**)
+## [Unreleased]
+
+## [0.9.0] — 2026-11-01 — security audit (**wire-breaking**)
 
 Full security audit with proof-of-concept tests; every finding below has a regression test.
 
@@ -61,7 +63,11 @@ Full security audit with proof-of-concept tests; every finding below has a regre
   rustls, h2, tokio, crossbeam, ctutils, time…); MSRV 1.88.
 
 ### Notes
-- Tests: 99 → 208. Fuzz targets: 2 → 8.
+- Tests: 99 → 213. Fuzz targets: 2 → 8.
+- Gossip replay state (post-audit review rounds): per-sender floors for evicted windows that are never
+  dropped (folded into 4 096 buckets keyed by a per-node secret), timestamps ≤ 30 s in the future, verdicts
+  that depend only on the message. Residual risk + deferred identity-PoW fix in
+  `docs/security-and-deferred.md`.
 - Residual gaps (documented): not a byte-exact JA3/JA4 of one Chrome build; the fake certificate flight
   does not survive a TLS-terminating censor; no NewSessionTicket.
 
