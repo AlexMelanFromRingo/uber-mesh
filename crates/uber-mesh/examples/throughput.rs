@@ -10,7 +10,7 @@ use tokio::net::TcpListener;
 use umesh_obfs::{ObfsPsk, ObfsTcp, ShapingPolicy};
 
 async fn run(total_mb: usize, shaping: ShapingPolicy, label: &str) {
-    let psk = ObfsPsk([7u8; 32]);
+    let psk = ObfsPsk::new([7u8; 32]);
     let chunk = vec![0xABu8; 8192];
     let n_msgs = total_mb * 1024 * 1024 / chunk.len();
 

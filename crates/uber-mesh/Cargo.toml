@@ -24,6 +24,7 @@ clap.workspace = true
 anyhow.workspace = true
 hex.workspace = true
 rand.workspace = true
+zeroize.workspace = true
 
 [lints]
 workspace = true

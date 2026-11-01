@@ -10,7 +10,12 @@ NODES="${NODES:-100}"
 DURATION="${DURATION:-90}"
 SCALE=$((NODES - 1))
 COMPOSE="docker compose -f docker/compose.yml"
-PROM="http://localhost:9090"
+PROM="http://127.0.0.1:9090"
+
+# Per-run secrets (never hardcoded): a fresh cohort PSK and Grafana admin password unless provided.
+gen_hex() { od -An -N"$1" -tx1 /dev/urandom | tr -d ' \n'; }
+export UMESH_PSK="${UMESH_PSK:-$(gen_hex 32)}"
+export GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD:-$(gen_hex 16)}"
 
 echo "=== building image (prebuilt binary) ==="
 docker build -q -t uber-mesh:bench -f docker/Dockerfile . >/dev/null
@@ -60,10 +65,11 @@ echo "  --- docker stats sample (live CPU%/mem, 5 containers) ---"
 docker stats --no-stream --format '    {{.Name}}: cpu={{.CPUPerc}} mem={{.MemUsage}}' $($COMPOSE ps -q | head -5) 2>/dev/null || true
 echo ""
 echo "=== Grafana pipeline (Prometheus -> Grafana) ==="
-GRAF="http://localhost:3000"
+GRAF="http://127.0.0.1:3000"
+GAUTH="admin:${GRAFANA_ADMIN_PASSWORD}"
 printf "  grafana health:                 %s\n" "$(curl -s $GRAF/api/health | python3 -c 'import sys,json;print(json.load(sys.stdin).get("database","?"))' 2>/dev/null || echo n/a)"
-printf "  provisioned datasource:         %s\n" "$(curl -s $GRAF/api/datasources | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d[0]["name"] if d else "none")' 2>/dev/null || echo n/a)"
-printf "  provisioned dashboard:          %s\n" "$(curl -s "$GRAF/api/search?query=uber-mesh" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d[0]["title"] if d else "none")' 2>/dev/null || echo n/a)"
-printf "  query via grafana (nodes up):   %s\n" "$(curl -s -G "$GRAF/api/datasources/proxy/uid/umesh-prom/api/v1/query" --data-urlencode 'query=count(umesh_peers_connected)' | python3 -c 'import sys,json;r=json.load(sys.stdin)["data"]["result"];print(r[0]["value"][1] if r else "n/a")' 2>/dev/null || echo n/a)"
-echo "  (Grafana UI: http://localhost:3000 — dashboard 'uber-mesh cluster', anonymous Admin)"
+printf "  provisioned datasource:         %s\n" "$(curl -s -u "$GAUTH" $GRAF/api/datasources | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d[0]["name"] if d else "none")' 2>/dev/null || echo n/a)"
+printf "  provisioned dashboard:          %s\n" "$(curl -s -u "$GAUTH" "$GRAF/api/search?query=uber-mesh" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d[0]["title"] if d else "none")' 2>/dev/null || echo n/a)"
+printf "  query via grafana (nodes up):   %s\n" "$(curl -s -u "$GAUTH" -G "$GRAF/api/datasources/proxy/uid/umesh-prom/api/v1/query" --data-urlencode 'query=count(umesh_peers_connected)' | python3 -c 'import sys,json;r=json.load(sys.stdin)["data"]["result"];print(r[0]["value"][1] if r else "n/a")' 2>/dev/null || echo n/a)"
+echo "  (Grafana UI: http://127.0.0.1:3000 — dashboard 'uber-mesh cluster', login admin / \$GRAFANA_ADMIN_PASSWORD)"
 echo "=== done (tearing down) ==="

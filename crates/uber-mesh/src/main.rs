@@ -1,18 +1,21 @@
 //! uber-mesh CLI entry point.
 
 mod cli;
+mod metrics_http;
 
+use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::{Context, bail};
 use clap::Parser;
-use cli::{Cli, Command, KeysCmd};
+use cli::{Cli, Command, KeysCmd, PskArgs};
 use rand::RngCore;
 use tracing_subscriber::EnvFilter;
 use umesh_crypto::identity::NodeIdentity;
 use umesh_node::config::Config;
 use umesh_node::status::NodeStatus;
 use umesh_node::{DataDir, Node, keystore};
+use zeroize::{Zeroize, Zeroizing};
 
 fn main() -> ExitCode {
     // Structured logs; never logs secrets. Level via RUST_LOG (default info).
@@ -46,13 +49,36 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             listen,
             bootstrap,
             psk,
-        } => build_runtime()?.block_on(cmd_run(&dd, profile, listen, bootstrap, psk)),
+        } => {
+            let psk = resolve_psk(&psk)?;
+            build_runtime()?.block_on(cmd_run(&dd, profile, listen, bootstrap, psk))
+        }
         Command::Mesh {
             listen,
             bootstrap,
             topic,
             psk,
-        } => build_runtime()?.block_on(cmd_mesh(&dd, listen, bootstrap, topic, psk)),
+            metrics_addr,
+            profile,
+            fallback,
+        } => {
+            let psk = resolve_psk(&psk)?;
+            let fallback = fallback.or_else(|| std::env::var("UMESH_FALLBACK").ok());
+            let metrics = metrics_http::resolve_addr(
+                metrics_addr.as_deref(),
+                std::env::var(metrics_http::ENV_ADDR).ok().as_deref(),
+                std::env::var(metrics_http::ENV_LEGACY_PORT).ok().as_deref(),
+            )?;
+            build_runtime()?.block_on(cmd_mesh(
+                &dd,
+                listen,
+                bootstrap,
+                topic,
+                psk,
+                metrics,
+                MeshTransport { profile, fallback },
+            ))
+        }
     }
 }
 
@@ -77,29 +103,49 @@ fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
     }
 }
 
-/// Minimal Prometheus `/metrics` HTTP server (no framework — the exposition format is plain text).
-async fn serve_metrics(addr: String) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let Ok(listener) = tokio::net::TcpListener::bind(&addr).await else {
-        tracing::warn!(%addr, "could not bind metrics endpoint");
-        return;
-    };
-    loop {
-        let Ok((mut sock, _)) = listener.accept().await else {
-            continue;
-        };
-        tokio::spawn(async move {
-            let mut buf = [0u8; 1024];
-            let _ = sock.read(&mut buf).await; // ignore the request line/headers
-            let body = umesh_p2p::metrics::render();
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = sock.write_all(resp.as_bytes()).await;
-        });
+/// Env var carrying the obfs PSK (hex) — preferred over `--psk`, which is visible in `ps`.
+const ENV_PSK: &str = "UMESH_PSK";
+
+/// Resolve a PSK override: `--psk-file` > `--psk` (deprecated) > `UMESH_PSK` > none (use config).
+fn resolve_psk(args: &PskArgs) -> anyhow::Result<Option<Zeroizing<String>>> {
+    resolve_psk_from(args, std::env::var(ENV_PSK).ok().map(Zeroizing::new))
+}
+
+fn resolve_psk_from(
+    args: &PskArgs,
+    env: Option<Zeroizing<String>>,
+) -> anyhow::Result<Option<Zeroizing<String>>> {
+    if let Some(path) = &args.psk_file {
+        return read_psk_file(path).map(Some);
     }
+    if let Some(p) = &args.psk {
+        tracing::warn!(
+            "--psk is deprecated: the PSK is visible to other local users in the process list; \
+             use --psk-file <PATH> or the {ENV_PSK} environment variable"
+        );
+        return Ok(Some(Zeroizing::new(p.clone())));
+    }
+    Ok(env.filter(|v| !v.trim().is_empty()))
+}
+
+/// Replace the config's PSK, wiping the previous value.
+fn set_psk(cfg: &mut Config, psk_hex: &str) {
+    let mut old = std::mem::replace(&mut cfg.psk_hex, psk_hex.to_string());
+    old.zeroize();
+}
+
+fn read_psk_file(path: &Path) -> anyhow::Result<Zeroizing<String>> {
+    let text = Zeroizing::new(
+        std::fs::read_to_string(path)
+            .with_context(|| format!("reading PSK file {}", path.display()))?,
+    );
+    Ok(Zeroizing::new(text.trim().to_string()))
+}
+
+/// Obfs-transport knobs for `mesh`: environment profile (record shaping) and probe fallback.
+struct MeshTransport {
+    profile: Option<String>,
+    fallback: Option<String>,
 }
 
 async fn cmd_mesh(
@@ -107,22 +153,40 @@ async fn cmd_mesh(
     listen: Option<String>,
     bootstrap: Vec<String>,
     topic: Option<String>,
-    psk: Option<String>,
+    psk: Option<Zeroizing<String>>,
+    metrics: Option<std::net::SocketAddr>,
+    transport: MeshTransport,
 ) -> anyhow::Result<()> {
+    let MeshTransport { profile, fallback } = transport;
     use std::time::Duration;
+    use umesh_obfs::handshake::ProbeResponse;
     use umesh_p2p::{MeshEvent, MeshNode};
 
     let id = keystore::load(&dd.identity())
         .with_context(|| format!("loading identity from {}", dd.identity().display()))?;
-    // PSK: --psk override, else from config (the shared bridge secret gating the obfs carrier).
+    // PSK: --psk-file / UMESH_PSK override, else from config (the shared bridge secret gating the
+    // obfs carrier).
     let mut cfg = Config::load(&dd.config())
         .with_context(|| format!("loading config from {}", dd.config().display()))?;
     if let Some(p) = psk {
-        cfg.psk_hex = p;
+        set_psk(&mut cfg, &p);
     }
     let psk = cfg.psk().context("invalid obfs PSK")?;
-    let seed = id.to_seed_bytes();
-    let mut node = MeshNode::new(&seed, psk).context("building mesh node")?;
+    if let Some(p) = profile {
+        cfg.profile = p;
+    }
+    // The environment profile drives record shaping on every obfs link (the libp2p path used to
+    // ignore it, leaking inner Noise/multistream record sizes); probes go to the cover site if set.
+    let shaping = cfg.profile().context("invalid --profile")?.shaping();
+    let probe = match fallback {
+        Some(f) => ProbeResponse::Fallback(f),
+        None => ProbeResponse::Silence,
+    };
+    let seed = Zeroizing::new(id.to_seed_bytes());
+    drop(id);
+    let mut node =
+        MeshNode::with_transport(&seed, psk, shaping, probe).context("building mesh node")?;
+    drop(seed);
 
     let topic = topic.unwrap_or_else(|| "uber-mesh/global".to_string());
     node.subscribe(&topic).context("subscribe")?;
@@ -134,18 +198,27 @@ async fn cmd_mesh(
         }
     }
 
-    // Prometheus /metrics endpoint (METRICS_PORT, default 9100; set to "off" to disable).
-    let metrics_port = std::env::var("METRICS_PORT").unwrap_or_else(|_| "9100".to_string());
-    if metrics_port != "off" {
-        tokio::spawn(serve_metrics(format!("0.0.0.0:{metrics_port}")));
-    }
+    // Opt-in Prometheus /metrics endpoint (off by default; loopback unless an IP is given).
+    let metrics_desc = match metrics {
+        Some(addr) => {
+            let listener = metrics_http::bind(addr).await?;
+            let bound = listener.local_addr()?;
+            tokio::spawn(metrics_http::serve(
+                listener,
+                metrics_http::Limits::default(),
+                umesh_p2p::metrics::render,
+            ));
+            format!("http://{bound}/metrics")
+        }
+        None => "off".to_string(),
+    };
 
     println!(
-        "uber-mesh gossip node started\n  libp2p peer: {}\n  app peer:    {}\n  topic:       {}\n  metrics:     :{}/metrics",
+        "uber-mesh gossip node started\n  libp2p peer: {}\n  app peer:    {}\n  topic:       {}\n  metrics:     {}",
         node.local_peer_id(),
         node.app_peer_id(),
         topic,
-        metrics_port,
+        metrics_desc,
     );
 
     let local = node.local_peer_id();
@@ -207,10 +280,10 @@ fn cmd_init(dd: &DataDir, force: bool) -> anyhow::Result<()> {
     keystore::save(&id_path, &id).context("writing identity")?;
 
     // Fresh 32-byte obfs PSK (a shared bridge secret to distribute out-of-band).
-    let mut psk = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut psk);
-    let psk_hex = hex::encode(psk);
-    let cfg = Config::default_with_psk(psk_hex.clone());
+    let mut psk = Zeroizing::new([0u8; 32]);
+    rand::rngs::OsRng.fill_bytes(&mut *psk);
+    let psk_hex = Zeroizing::new(hex::encode(psk.as_slice()));
+    let cfg = Config::default_with_psk(psk_hex.to_string());
     cfg.save(&cfg_path).context("writing config")?;
 
     println!("initialized uber-mesh node");
@@ -219,7 +292,10 @@ fn cmd_init(dd: &DataDir, force: bool) -> anyhow::Result<()> {
     println!("  config:   {}", cfg_path.display());
     println!();
     println!("share this obfs PSK out-of-band with peers that should reach you:");
-    println!("  PSK: {psk_hex}");
+    println!("  PSK: {}", psk_hex.as_str());
+    println!(
+        "  (pass it to peers' nodes via --psk-file <PATH> or the {ENV_PSK} env var, not --psk)"
+    );
     Ok(())
 }
 
@@ -263,11 +339,12 @@ async fn cmd_run(
     profile: Option<String>,
     listen: Option<String>,
     bootstrap: Vec<String>,
-    psk: Option<String>,
+    psk: Option<Zeroizing<String>>,
 ) -> anyhow::Result<()> {
     let (id, mut cfg) = load(dd)?;
     if let Some(p) = profile {
         cfg.profile = p;
+        cfg.profile().context("invalid --profile")?;
     }
     if let Some(l) = listen {
         cfg.listen = Some(l);
@@ -276,7 +353,7 @@ async fn cmd_run(
         cfg.bootstrap = bootstrap;
     }
     if let Some(p) = psk {
-        cfg.psk_hex = p;
+        set_psk(&mut cfg, &p);
     }
     // Validate the PSK before starting.
     cfg.psk().context("invalid obfs PSK")?;
@@ -284,4 +361,74 @@ async fn cmd_run(
     let node = std::sync::Arc::new(Node::new(id, cfg));
     node.run().await.context("node runtime")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmpfile(tag: &str, contents: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("umesh-cli-{tag}-{}", std::process::id()));
+        std::fs::write(&p, contents).unwrap();
+        p
+    }
+
+    #[test]
+    fn psk_sources_and_precedence() {
+        let env = || Some(Zeroizing::new("ee".repeat(32)));
+        // Nothing given ⇒ env, else config (None).
+        let none = PskArgs::default();
+        assert_eq!(
+            resolve_psk_from(&none, env()).unwrap().unwrap().as_str(),
+            "ee".repeat(32)
+        );
+        assert!(resolve_psk_from(&none, None).unwrap().is_none());
+        assert!(
+            resolve_psk_from(&none, Some(Zeroizing::new(" ".into())))
+                .unwrap()
+                .is_none()
+        );
+
+        // --psk-file wins over env (whitespace/newline trimmed).
+        let f = tmpfile("psk", &format!("{}\n", "ff".repeat(32)));
+        let args = PskArgs {
+            psk_file: Some(f.clone()),
+            psk: None,
+        };
+        assert_eq!(
+            resolve_psk_from(&args, env()).unwrap().unwrap().as_str(),
+            "ff".repeat(32)
+        );
+        std::fs::remove_file(&f).ok();
+        assert!(
+            resolve_psk_from(&args, env()).is_err(),
+            "missing file is an error"
+        );
+
+        // Deprecated --psk still works and wins over env.
+        let args = PskArgs {
+            psk_file: None,
+            psk: Some("aa".repeat(32)),
+        };
+        assert_eq!(
+            resolve_psk_from(&args, env()).unwrap().unwrap().as_str(),
+            "aa".repeat(32)
+        );
+    }
+
+    #[test]
+    fn psk_and_psk_file_conflict() {
+        let r = Cli::try_parse_from(["uber-mesh", "run", "--psk", "aa", "--psk-file", "/x"]);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn mesh_metrics_flag_parses_and_defaults_off() {
+        let cli = Cli::try_parse_from(["uber-mesh", "mesh"]).unwrap();
+        let Command::Mesh { metrics_addr, .. } = cli.command else {
+            panic!("expected mesh")
+        };
+        assert!(metrics_addr.is_none());
+        assert_eq!(metrics_http::resolve_addr(None, None, None).unwrap(), None);
+    }
 }

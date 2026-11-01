@@ -5,7 +5,10 @@
 version = 2
 # Fail the build on any security advisory or unmaintained/yanked crate.
 yanked = "deny"
-# Documented, reviewed exceptions only (constitution Principle VII — we acknowledge these, not hide them):
+# Documented, reviewed exceptions only (constitution Principle VII — we acknowledge these, not hide them).
+# Every entry is mirrored as an `--ignore` flag on the cargo-audit job in
+# .github/workflows/ci.yml — keep both lists in sync. Never add a real vulnerability here: update the
+# dependency. Re-check every entry after `cargo update` and delete it once it no longer matches.
 ignore = [
     # bincode is flagged "unmaintained". We deliberately depend on the 2.x line: bincode 3.0.0 is a
     # protest/troll release that refuses to compile, and 2.x is the real, maintained-as-of-pin API.
@@ -14,9 +17,13 @@ ignore = [
     # `paste` (proc-macro) is unmaintained but is a transitive dep pulled by the crypto stack, has no
     # known vulnerability, and runs only at compile time. No drop-in replacement is pulled by our deps.
     "RUSTSEC-2024-0436",
-    # Unsound `IterMut` (Stacked-Borrows violation) in a transitive dependency. Not reachable through
-    # our usage; tracked upstream. No fixed release is available in the current dependency tree.
-    "RUSTSEC-2026-0002",
+    # hickory-proto 0.25.2 (DNSSEC NSEC3 loop; O(n²) name compression) is NOT compiled into any
+    # uber-mesh binary: it sits in Cargo.lock only because libp2p's `tokio` feature names
+    # `libp2p-mdns?/tokio` / `libp2p-dns?/tokio` (weak deps lock optional crates even when off —
+    # rust-lang/cargo#10801). We enable neither mdns nor dns. CI's `deps-not-built` guard fails if
+    # hickory-proto ever enters the real build graph, at which point these ignores must go.
+    "RUSTSEC-2026-0118",
+    "RUSTSEC-2026-0119",
 ]
 
 [licenses]

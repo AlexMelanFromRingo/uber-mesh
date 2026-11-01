@@ -120,7 +120,7 @@ async fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let latency = Duration::from_millis(latency_ms);
-    let psk = ObfsPsk([42u8; 32]);
+    let psk = ObfsPsk::new([42u8; 32]);
 
     println!(
         "=== uber-mesh cluster benchmark: {n} nodes, link latency {latency_ms}ms (each direction) ==="
@@ -141,10 +141,10 @@ async fn main() {
     // Collect each node's real listen address.
     let mut real_addrs: Vec<Option<String>> = vec![None; n];
     while real_addrs.iter().filter(|a| a.is_some()).count() < n {
-        if let Some(Metric::Listening(i, a)) = evt_rx.recv().await {
-            if real_addrs[i].is_none() {
-                real_addrs[i] = Some(a);
-            }
+        if let Some(Metric::Listening(i, a)) = evt_rx.recv().await
+            && real_addrs[i].is_none()
+        {
+            real_addrs[i] = Some(a);
         }
     }
     let real_addrs: Vec<String> = real_addrs.into_iter().map(|a| a.unwrap()).collect();

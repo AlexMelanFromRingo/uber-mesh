@@ -3,23 +3,35 @@
 # faithful way to emulate geographic dispersion on one host.
 #
 #   docker build -t uber-mesh:bench -f docker/Dockerfile .
+#   export UMESH_PSK=$(openssl rand -hex 32) GRAFANA_ADMIN_PASSWORD=$(openssl rand -hex 16)
 #   docker compose -f docker/compose.geo.yml up -d --scale region_near=6 --scale region_mid=6 --scale region_far=6
-#   # ... query Prometheus (http://localhost:9090) / Grafana (http://localhost:3000) ...
+#   # ... query Prometheus (http://127.0.0.1:9090) / Grafana (http://127.0.0.1:3000, admin / $GRAFANA_ADMIN_PASSWORD) ...
 #   docker compose -f docker/compose.geo.yml down -v
+#
+# Same security posture as compose.yml (PSK from env, loopback-only published ports, no anonymous
+# Grafana, nodes drop to uid 10001 after applying tc-netem, pinned images).
 
 x-env: &env
-  UMESH_PSK: "4242424242424242424242424242424242424242424242424242424242424242"
-  METRICS_PORT: "9100"
+  UMESH_PSK: "${UMESH_PSK:?export UMESH_PSK=$(openssl rand -hex 32)}"
+  UMESH_METRICS_ADDR: "0.0.0.0:9100" # private bridge network only; not published
   RUST_LOG: "warn"
   BOOTSTRAP: "/ip4/172.30.0.10/tcp/4001"
 
+x-netem-node: &netem-node
+  image: uber-mesh:bench
+  user: "0:0" # entrypoint applies tc-netem, then drops to uid 10001
+  cap_drop: [ALL]
+  cap_add: [NET_ADMIN, SETUID, SETGID]
+  security_opt: ["no-new-privileges:true"]
+  read_only: true
+  tmpfs: ["/data:uid=10001,gid=10001,mode=0700"]
+
 services:
   boot:
-    image: uber-mesh:bench
-    cap_add: [NET_ADMIN]
+    <<: *netem-node
     environment:
-      UMESH_PSK: "4242424242424242424242424242424242424242424242424242424242424242"
-      METRICS_PORT: "9100"
+      UMESH_PSK: "${UMESH_PSK:?export UMESH_PSK=$(openssl rand -hex 32)}"
+      UMESH_METRICS_ADDR: "0.0.0.0:9100"
       RUST_LOG: "warn"
       NETEM: "delay 15ms 5ms distribution normal"
     networks:
@@ -27,42 +39,45 @@ services:
         ipv4_address: 172.30.0.10
 
   region_near:
-    image: uber-mesh:bench
-    cap_add: [NET_ADMIN]
+    <<: *netem-node
     depends_on: [boot]
     environment: { <<: *env, NETEM: "delay 20ms 5ms distribution normal" }
     networks: [mesh]
 
   region_mid:
-    image: uber-mesh:bench
-    cap_add: [NET_ADMIN]
+    <<: *netem-node
     depends_on: [boot]
     environment: { <<: *env, NETEM: "delay 90ms 15ms distribution normal" }
     networks: [mesh]
 
   region_far:
-    image: uber-mesh:bench
-    cap_add: [NET_ADMIN]
+    <<: *netem-node
     depends_on: [boot]
     environment: { <<: *env, NETEM: "delay 200ms 25ms distribution normal loss 1%" }
     networks: [mesh]
 
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v3.15.1@sha256:fa3302279710be2f21a8301ec17a8b4f2301fd829bd113839b3b6b02b6f191a2
     command: [--config.file=/etc/prometheus/prometheus.yml, --storage.tsdb.retention.time=1h]
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
-    ports: ["9090:9090"]
+    ports: ["127.0.0.1:9090:9090"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
     depends_on: [boot]
     networks: [mesh]
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:13.2.5@sha256:9f7aa1e1e3246aade5792d35a738049f7f32f89cd51d1956cf426a4e86268a84
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: admin
-      GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
-    ports: ["3000:3000"]
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:?export GRAFANA_ADMIN_PASSWORD=$(openssl rand -hex 16)}"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    ports: ["127.0.0.1:3000:3000"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
     volumes:
       - ./grafana/datasource.yml:/etc/grafana/provisioning/datasources/ds.yml:ro
       - ./grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/dash.yml:ro
