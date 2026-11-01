@@ -24,7 +24,8 @@ use umesh_obfs::wire::read_record_raw;
 use umesh_obfs::{
     ClientConfig, Endpoint, ListenerConfig, ObfsError, ObfsListener, ObfsPsk, ObfsTcp,
     ProbeResponse, ShapingPolicy, client_handshake, client_handshake_with,
-    connect_first_working_with, server_handshake, server_handshake_probe, tls,
+    connect_first_working_with, server_handshake, server_handshake_detached,
+    server_handshake_probe, tls,
 };
 
 fn hex(b: &[u8]) -> String {
@@ -345,6 +346,46 @@ async fn audit_http_probe_forwarded_immediately_and_completely() {
         &rec.lock().await[..],
         &req[..],
         "every probe byte reaches the upstream"
+    );
+}
+
+/// Review fix: a fallback relay can last up to FALLBACK_MAX_DURATION; in the libp2p upgrade it used
+/// to hold a pending-incoming slot that whole time (64 lingering probers = no new inbound peers).
+/// `server_handshake_detached` must return at once while the relay keeps serving the prober.
+#[tokio::test]
+async fn detached_probe_returns_immediately_while_relay_continues() {
+    let (up_addr, rec) = recording_upstream(b"HTTP/1.1 200 OK\r\n\r\n").await;
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let pol = ProbeResponse::Fallback(up_addr);
+    let server = tokio::spawn(async move {
+        let (s, _) = l.accept().await.unwrap();
+        let t0 = Instant::now();
+        let r = server_handshake_detached(s, &ObfsPsk::new([1; 32]), &pol).await;
+        (r.is_err(), t0.elapsed())
+    });
+    let mut p = TcpStream::connect(addr).await.unwrap();
+    p.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .await
+        .unwrap();
+    let (failed, took) = server.await.unwrap();
+    assert!(failed, "a probe is never an accepted session");
+    assert!(
+        took < Duration::from_secs(2),
+        "handshake returned only after {took:?}"
+    );
+    // The prober keeps talking to the cover site through the detached relay.
+    let mut b = [0u8; 15];
+    tokio::time::timeout(Duration::from_secs(3), p.read_exact(&mut b))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&b, b"HTTP/1.1 200 OK");
+    p.write_all(b"more").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        rec.lock().await.ends_with(b"more"),
+        "relay still alive after the handshake returned"
     );
 }
 

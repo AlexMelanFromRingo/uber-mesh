@@ -109,6 +109,15 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout for connecting to the fallback (cover) upstream.
 const FALLBACK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Hard cap on one fallback relay (connect + forward + bidirectional copy). A prober browsing the
+/// cover site longer than this is cut off — an acceptable tell versus letting probers pin
+/// unbounded resources.
+pub const FALLBACK_MAX_DURATION: Duration = Duration::from_secs(90);
+/// Process-wide cap on concurrent fallback relays; beyond it a probe gets silence (bounded at
+/// ~400 ms) so a probe flood cannot exhaust sockets/tasks or the accept/upgrade slots.
+pub const MAX_CONCURRENT_FALLBACKS: usize = 64;
+static FALLBACK_SLOTS: LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FALLBACKS)));
 /// Hard cap on bytes drained from a rejected/probing connection (DoS bound).
 const MAX_DRAIN_BYTES: usize = 64 * 1024;
 /// Plaintext length of a key confirmation; sealed = 24 + 13 + 16 = 53 bytes, the size of a real
@@ -768,18 +777,53 @@ where
     match probe {
         ProbeResponse::Silence => silence(stream).await,
         ProbeResponse::Fallback(upstream) => {
-            match tokio::time::timeout(FALLBACK_CONNECT_TIMEOUT, TcpStream::connect(upstream)).await
-            {
-                Ok(Ok(mut up)) => {
-                    let _ = up.set_nodelay(true);
-                    if up.write_all(prefix).await.is_ok() {
-                        let _ = tokio::io::copy_bidirectional(stream, &mut up).await;
+            // Bounded: at most MAX_CONCURRENT_FALLBACKS relays, each at most FALLBACK_MAX_DURATION.
+            let Ok(_slot) = FALLBACK_SLOTS.clone().try_acquire_owned() else {
+                return silence(stream).await;
+            };
+            let relay = async {
+                match tokio::time::timeout(FALLBACK_CONNECT_TIMEOUT, TcpStream::connect(upstream))
+                    .await
+                {
+                    Ok(Ok(mut up)) => {
+                        let _ = up.set_nodelay(true);
+                        if up.write_all(prefix).await.is_ok() {
+                            let _ = tokio::io::copy_bidirectional(stream, &mut up).await;
+                        }
+                        true
                     }
+                    _ => false,
                 }
+            };
+            match tokio::time::timeout(FALLBACK_MAX_DURATION, relay).await {
+                Ok(true) | Err(_) => {}
                 // Upstream unreachable ⇒ silence rather than a distinguishing error.
-                _ => silence(stream).await,
+                Ok(false) => silence(stream).await,
             }
         }
+    }
+}
+
+/// Like [`server_handshake_probe`], but takes ownership of the stream and runs the probe response
+/// in a detached task, returning `AuthFailed` immediately. Use this where the caller holds a scarce
+/// slot for the duration of the handshake (libp2p's pending-incoming connection cap): a fallback
+/// relay to the cover site can last up to [`FALLBACK_MAX_DURATION`] and must not occupy that slot.
+pub async fn server_handshake_detached<S>(
+    mut stream: S,
+    psk: &ObfsPsk,
+    probe: &ProbeResponse,
+) -> Result<(S, SessionKeys)>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    match server_handshake_core(&mut stream, psk).await {
+        ServerOutcome::Accepted(keys) => Ok((stream, keys)),
+        ServerOutcome::Probe(prefix) => {
+            let probe = probe.clone();
+            tokio::spawn(async move { handle_probe(&mut stream, &prefix, &probe).await });
+            Err(ObfsError::AuthFailed)
+        }
+        ServerOutcome::Failed(e) => Err(e),
     }
 }
 

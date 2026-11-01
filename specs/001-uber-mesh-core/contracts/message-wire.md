@@ -67,8 +67,11 @@ P4); **Ignore** = not propagated, *not* penalized (an honest peer can relay it, 
    window are accepted exactly once.
 
 State bounds: the dedup set (default 65 536 ids) and per-sender windows (default 16 384 senders, ≤ 256
-seqnos each) are capacity-bounded with least-recently-used eviction, and entries expire `2 × skew_window`
-after last use (after that, replays of the messages they protected fail step 7 anyway). Eviction under a
-flood can only re-open a replay inside the timestamp window; it never blocks legitimate traffic.
+seqnos each) are capacity-bounded, and entries expire `2 × skew_window` after last use (after that,
+replays of the messages they protected fail step 7 anyway). The guard **fails closed**: while the state is
+full of still-live entries, a message from a new sender (or any message when the dedup set is full) is
+dropped as `Saturated` (gossipsub `Ignore`, no penalty) instead of evicting a live window — eviction would let
+a flood of fresh identities re-open a replay of a victim's message. Under such a flood new messages may be
+dropped until state expires; replays never get through.
 
 Envelope fields use fixed-width little-endian encoding for a stable transcript (no bincode in this format).

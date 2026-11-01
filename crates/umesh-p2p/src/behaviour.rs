@@ -24,7 +24,8 @@ use libp2p::{
 };
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use umesh_obfs::{
-    ObfsByteStream, ObfsPsk, ProbeResponse, ShapingPolicy, client_handshake, server_handshake_probe,
+    ObfsByteStream, ObfsPsk, ProbeResponse, ShapingPolicy, client_handshake,
+    server_handshake_detached,
 };
 
 use crate::blobs::{BLOB_PROTOCOL, BlobCodec};
@@ -258,17 +259,19 @@ pub fn build_swarm(
                         // Bridge libp2p's futures-io stream to our tokio-based obfs handshake.
                         let mut tk = conn.compat();
                         let started = std::time::Instant::now();
+                        // Inbound: the probe response (possibly a long cover-site relay) runs in a
+                        // detached, capped task so it never holds a libp2p pending-incoming slot.
                         let result = if obfs_runs_client(&point) {
-                            client_handshake(&mut tk, &psk).await
+                            client_handshake(&mut tk, &psk).await.map(|k| (tk, k))
                         } else {
-                            server_handshake_probe(&mut tk, &psk, &probe).await
+                            server_handshake_detached(tk, &psk, &probe).await
                         };
-                        let keys = match result {
-                            Ok(k) => {
+                        let (tk, keys) = match result {
+                            Ok(v) => {
                                 crate::metrics::record_handshake(
                                     started.elapsed().as_millis() as u64
                                 );
-                                k
+                                v
                             }
                             Err(e) => {
                                 crate::metrics::inc(&crate::metrics::HANDSHAKE_FAILS);

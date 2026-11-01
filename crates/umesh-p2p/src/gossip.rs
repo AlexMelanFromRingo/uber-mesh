@@ -91,6 +91,10 @@ pub enum MsgError {
     /// The signed topic differs from the gossipsub topic the message arrived on.
     #[error("signed topic does not match delivery topic")]
     TopicMismatch,
+    /// Replay state is full of still-live entries; the message is dropped rather than evicting a
+    /// live replay window (fail closed). Not the sender's fault, so only ignored.
+    #[error("replay state saturated")]
+    Saturated,
 }
 
 impl MsgError {
@@ -102,7 +106,11 @@ impl MsgError {
     pub fn is_invalid(&self) -> bool {
         !matches!(
             self,
-            MsgError::Replay | MsgError::Duplicate | MsgError::Timestamp | MsgError::Version
+            MsgError::Replay
+                | MsgError::Duplicate
+                | MsgError::Timestamp
+                | MsgError::Version
+                | MsgError::Saturated
         )
     }
 }
@@ -358,6 +366,15 @@ impl ReplayGuard {
         {
             return Err(MsgError::Replay);
         }
+        // Fail closed: everything left after expiry is still inside its replay-relevant lifetime.
+        // Evicting it to make room would let a flood of fresh identities push out a victim's
+        // window (or a message id) and then replay the victim's message. Drop the newcomer instead;
+        // state frees itself `2·skew` later.
+        if (!self.senders.contains_key(&msg.sender) && self.senders.is_full())
+            || self.seen.is_full()
+        {
+            return Err(MsgError::Saturated);
+        }
 
         // Accept: record the seqno in the sender's window and slide it.
         let window_us = self.skew_ms.saturating_mul(1000);
@@ -583,7 +600,14 @@ mod tests {
         for i in 0..100u8 {
             let id = NodeIdentity::from_seed(&[i; 32]);
             let m = SignedMessage::create(&id, "t", vec![i], 1, 5000);
-            assert!(validate(&m, &mut g, 5000).is_ok());
+            // The first 8 senders fit; the rest are dropped (fail closed), never evicting a live
+            // replay window.
+            let r = validate(&m, &mut g, 5000);
+            if i < 8 {
+                assert!(r.is_ok());
+            } else {
+                assert_eq!(r.map(|_| ()), Err(MsgError::Saturated));
+            }
             assert!(g.tracked_senders() <= 8 && g.tracked_ids() <= 32);
         }
         // After 2·skew everything expires on the next accept.
@@ -598,5 +622,33 @@ mod tests {
         assert!(SignedMessage::decode(&[]).is_err());
         assert!(SignedMessage::decode(&[0xff; 4]).is_err());
         assert!(SignedMessage::decode(&[1, 0, 0]).is_err()); // version ok, truncated
+    }
+    /// Regression: a flood of fresh identities used to evict a victim's replay window (LRU), after
+    /// which the victim's message could be replayed. Now the guard fails closed instead.
+    #[test]
+    fn full_replay_state_fails_closed_instead_of_evicting() {
+        let mut g = ReplayGuard::with_limits(60_000, 1024, 4);
+        let msg_from = |seed: u8, seqno: u64, ts: u64| msg(seed, seqno, ts, b"x").0;
+        let victim = msg_from(1, 1, 1000);
+        assert_eq!(validate(&victim, &mut g, 1000).map(|_| ()), Ok(()));
+        for k in 2..=4u8 {
+            assert!(validate(&msg_from(k, 1, 1000), &mut g, 1000).is_ok());
+        }
+        // A fifth fresh sender cannot push the victim's window out…
+        assert_eq!(
+            validate(&msg_from(5, 1, 1000), &mut g, 1000).map(|_| ()),
+            Err(MsgError::Saturated)
+        );
+        assert!(
+            !MsgError::Saturated.is_invalid(),
+            "saturation is not the sender's fault"
+        );
+        // …so the victim's message is still recognised as a replay.
+        assert!(matches!(
+            validate(&victim, &mut g, 1001),
+            Err(MsgError::Replay | MsgError::Duplicate)
+        ));
+        // Once the old state expires (2·skew), new senders are admitted again.
+        assert!(validate(&msg_from(5, 1, 130_001), &mut g, 130_001).is_ok());
     }
 }

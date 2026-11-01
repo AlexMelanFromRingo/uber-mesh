@@ -42,6 +42,11 @@ impl<K: Hash + Eq + Clone, V> BoundedMap<K, V> {
         self.map.is_empty()
     }
 
+    /// Whether the map holds `cap` entries (the next new key would evict one).
+    pub fn is_full(&self) -> bool {
+        self.map.len() >= self.cap
+    }
+
     /// Whether `k` is present (does not count as a touch).
     pub fn contains_key(&self, k: &K) -> bool {
         self.map.contains_key(k)

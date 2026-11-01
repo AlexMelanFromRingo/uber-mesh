@@ -29,7 +29,7 @@ pub use bytestream::ObfsByteStream;
 pub use error::{ObfsError, Result};
 pub use handshake::{
     ClientConfig, ObfsPsk, ProbeResponse, ReplayCache, SessionKeys, client_handshake,
-    client_handshake_with, server_handshake, server_handshake_probe,
+    client_handshake_with, server_handshake, server_handshake_detached, server_handshake_probe,
 };
 pub use profile::{Profile, TransportKind};
 pub use secure::SecureStream;
