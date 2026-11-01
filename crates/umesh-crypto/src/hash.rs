@@ -14,8 +14,6 @@ pub mod labels {
     pub const TRAFFIC_C2S: &str = "uber-mesh v1 traffic c2s";
     /// Traffic key, responder → initiator (server-to-client).
     pub const TRAFFIC_S2C: &str = "uber-mesh v1 traffic s2c";
-    /// Hybrid X-Wing-style KEM combiner output.
-    pub const XWING: &str = "uber-mesh v1 xwing";
     /// obfs-tcp MAC-gate key (derived from the per-listener PSK).
     pub const OBFS_MAC: &str = "uber-mesh v1 obfs-mac";
     /// obfs-tcp frame key (derived from the per-listener PSK).
@@ -26,6 +24,13 @@ pub mod labels {
     pub const POW: &str = "uber-mesh v1 pow";
     /// Proof-of-work solution digest: `H(challenge ‖ nonce)` (distinct from challenge derivation).
     pub const POW_SOLVE: &str = "uber-mesh v1 pow solve";
+    /// Gossip-sender identity proof-of-work: `H(sender_key ‖ nonce)` (see [`crate::pow`]).
+    pub const IDENTITY_POW: &str = "uber-mesh v1 identity pow";
+    /// Sealed-topic root key: `derive_key(TOPIC_KEY, topic_key ‖ topic)` (end-to-end gossip
+    /// confidentiality; the out-of-band topic key never encrypts anything directly).
+    pub const TOPIC_KEY: &str = "uber-mesh v1 topic key";
+    /// Per-epoch sealed-topic AEAD key: `derive_key(TOPIC_EPOCH_KEY, topic_root ‖ u64_le(epoch))`.
+    pub const TOPIC_EPOCH_KEY: &str = "uber-mesh v1 topic epoch key";
     /// Merkle leaf hashing (RFC 9162 `0x00` prefix equivalent).
     pub const MERKLE_LEAF: &str = "uber-mesh v1 merkle leaf";
     /// Merkle internal-node hashing (RFC 9162 `0x01` prefix equivalent).
@@ -119,12 +124,14 @@ mod tests {
         let all = [
             labels::TRAFFIC_C2S,
             labels::TRAFFIC_S2C,
-            labels::XWING,
             labels::OBFS_MAC,
             labels::OBFS_FRAME,
             labels::CID,
             labels::POW,
             labels::POW_SOLVE,
+            labels::IDENTITY_POW,
+            labels::TOPIC_KEY,
+            labels::TOPIC_EPOCH_KEY,
             labels::MERKLE_LEAF,
             labels::MERKLE_NODE,
             labels::MERKLE_ROOT,

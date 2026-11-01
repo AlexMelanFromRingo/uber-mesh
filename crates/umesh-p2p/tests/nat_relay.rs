@@ -13,13 +13,15 @@
 use std::time::Duration;
 
 use umesh_obfs::ObfsPsk;
-use umesh_p2p::{MeshEvent, MeshNode};
+use umesh_p2p::MeshEvent;
+
+mod common;
 
 #[tokio::test]
 async fn connects_to_relay_node_over_obfs() {
     let psk = ObfsPsk::new([6u8; 32]);
-    let mut relay = MeshNode::new(&[1u8; 32], psk.clone()).unwrap();
-    let mut client = MeshNode::new(&[2u8; 32], psk).unwrap();
+    let mut relay = common::node(&[1u8; 32], psk.clone()).unwrap();
+    let mut client = common::node(&[2u8; 32], psk).unwrap();
     let relay_peer = relay.local_peer_id();
 
     relay.listen("/ip4/127.0.0.1/tcp/0").unwrap();
@@ -62,8 +64,8 @@ async fn connects_to_relay_node_over_obfs() {
 #[tokio::test]
 async fn relay_reservation_accepted_with_confirmed_address() {
     let psk = ObfsPsk::new([16u8; 32]);
-    let mut relay = MeshNode::new(&[11u8; 32], psk.clone()).unwrap();
-    let mut client = MeshNode::new(&[12u8; 32], psk).unwrap();
+    let mut relay = common::node(&[11u8; 32], psk.clone()).unwrap();
+    let mut client = common::node(&[12u8; 32], psk).unwrap();
     let relay_peer = relay.local_peer_id();
 
     relay.listen("/ip4/127.0.0.1/tcp/0").unwrap();

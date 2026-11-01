@@ -11,6 +11,10 @@ description = "libp2p mesh behaviour for uber-mesh (signed gossip, discovery, NA
 umesh-crypto.workspace = true
 umesh-obfs.workspace = true
 rand.workspace = true
+# Sealed topics/blobs (end-to-end confidentiality): wipe topic/content keys on drop, constant-time
+# key comparison. Both are already in the tree via umesh-crypto.
+zeroize.workspace = true
+subtle.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
 tracing.workspace = true

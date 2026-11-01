@@ -13,19 +13,19 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
+use libp2p::core::muxing::StreamMuxerBox;
+use libp2p::core::transport::timeout::TransportTimeout;
 use libp2p::core::upgrade::Version;
 use libp2p::core::{ConnectedPoint, Endpoint};
 use libp2p::kad::store::MemoryStore;
 use libp2p::swarm::NetworkBehaviour;
-use libp2p::core::muxing::StreamMuxerBox;
-use libp2p::core::transport::timeout::TransportTimeout;
 use libp2p::{
     StreamProtocol, Swarm, Transport, autonat, connection_limits, dcutr, gossipsub, identify,
     identity, kad, noise, ping, relay, request_response, tcp, yamux,
 };
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use umesh_obfs::{
-    ObfsByteStream, ObfsPsk, ProbeResponse, ShapingPolicy, client_handshake,
+    ClientConfig, ObfsByteStream, ObfsPsk, ProbeResponse, ShapingPolicy, client_handshake_with,
     server_handshake_detached,
 };
 
@@ -243,6 +243,7 @@ pub fn build_swarm(
     psk: ObfsPsk,
     shaping: ShapingPolicy,
     probe: ProbeResponse,
+    client: ClientConfig,
 ) -> Result<Swarm<MeshBehaviour>, P2pError> {
     let keypair =
         identity::Keypair::ed25519_from_bytes(*seed).map_err(|e| P2pError::Init(e.to_string()))?;
@@ -254,43 +255,43 @@ pub fn build_swarm(
     let init = |e: Box<dyn std::error::Error + Send + Sync>| P2pError::Init(e.to_string());
     let local_peer_id = keypair.public().to_peer_id();
     let obfs_tcp = {
-            let noise = noise::Config::new(&keypair).map_err(|e| init(e.into()))?;
-            tcp::tokio::Transport::new(tcp::Config::default())
-                .and_then(move |conn, point| {
-                    let psk = psk.clone();
-                    let probe = probe.clone();
-                    let shaping = shaping.clone();
-                    async move {
-                        // Bridge libp2p's futures-io stream to our tokio-based obfs handshake.
-                        let mut tk = conn.compat();
-                        let started = std::time::Instant::now();
-                        // Inbound: the probe response (possibly a long cover-site relay) runs in a
-                        // detached, capped task so it never holds a libp2p pending-incoming slot.
-                        let result = if obfs_runs_client(&point) {
-                            client_handshake(&mut tk, &psk).await.map(|k| (tk, k))
-                        } else {
-                            server_handshake_detached(tk, &psk, &probe).await
-                        };
-                        let (tk, keys) = match result {
-                            Ok(v) => {
-                                crate::metrics::record_handshake(
-                                    started.elapsed().as_millis() as u64
-                                );
-                                v
-                            }
-                            Err(e) => {
-                                crate::metrics::inc(&crate::metrics::HANDSHAKE_FAILS);
-                                return Err(io::Error::other(e.to_string()));
-                            }
-                        };
-                        // Expose the obfs byte stream back as futures-io for the Noise/Yamux upgrade.
-                        Ok::<_, io::Error>(shaped_stream(tk, keys, shaping).compat())
-                    }
-                })
-                .upgrade(Version::V1)
-                .authenticate(noise)
-                .multiplex(yamux::Config::default())
-                .map(|(peer, conn), _| (peer, StreamMuxerBox::new(conn)))
+        let noise = noise::Config::new(&keypair).map_err(|e| init(e.into()))?;
+        tcp::tokio::Transport::new(tcp::Config::default())
+            .and_then(move |conn, point| {
+                let psk = psk.clone();
+                let probe = probe.clone();
+                let shaping = shaping.clone();
+                async move {
+                    // Bridge libp2p's futures-io stream to our tokio-based obfs handshake.
+                    let mut tk = conn.compat();
+                    let started = std::time::Instant::now();
+                    // Inbound: the probe response (possibly a long cover-site relay) runs in a
+                    // detached, capped task so it never holds a libp2p pending-incoming slot.
+                    let result = if obfs_runs_client(&point) {
+                        client_handshake_with(&mut tk, &psk, &client)
+                            .await
+                            .map(|k| (tk, k))
+                    } else {
+                        server_handshake_detached(tk, &psk, &probe).await
+                    };
+                    let (tk, keys) = match result {
+                        Ok(v) => {
+                            crate::metrics::record_handshake(started.elapsed().as_millis() as u64);
+                            v
+                        }
+                        Err(e) => {
+                            crate::metrics::inc(&crate::metrics::HANDSHAKE_FAILS);
+                            return Err(io::Error::other(e.to_string()));
+                        }
+                    };
+                    // Expose the obfs byte stream back as futures-io for the Noise/Yamux upgrade.
+                    Ok::<_, io::Error>(shaped_stream(tk, keys, shaping).compat())
+                }
+            })
+            .upgrade(Version::V1)
+            .authenticate(noise)
+            .multiplex(yamux::Config::default())
+            .map(|(peer, conn), _| (peer, StreamMuxerBox::new(conn)))
     };
     let (relay_transport, relay_behaviour) = relay::client::new(local_peer_id);
     let relay_transport = relay_transport

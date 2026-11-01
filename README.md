@@ -45,10 +45,11 @@ blocks, and verify every message end-to-end without any central authority.
 
 | Capability | What it does |
 |---|---|
-| 🔐 **Hybrid post-quantum** | Every link is keyed by **X25519 + ML-KEM-768** via an X-Wing-style BLAKE3 combiner. Classical half stays authoritative; all mesh data rides a PQ-keyed tunnel (no harvest-now-decrypt-later). |
+| 🔐 **Hybrid post-quantum** | Every link is keyed by **X25519 + ML-KEM-768** via **X-Wing** (draft-connolly-cfrg-xwing-kem-11, KAT-verified against the official vectors). Classical half stays authoritative; all mesh data rides a PQ-keyed tunnel (no harvest-now-decrypt-later). |
 | 🥷 **TLS-1.3-ClientHello mimicry** | The obfs handshake is a *structurally-valid* TLS 1.3 ClientHello → ServerHello with a PQ-hybrid `X25519MLKEM768` key_share. Defeats entropy/no-header **and** TLS-state-machine DPI; blends with real PQ-TLS. |
 | 🪞 **REALITY-style probe resistance** | A peer without the shared PSK fails the gate and gets **silence** or is **reverse-proxied to a real cover site** — an active prober can't distinguish a node from a genuine TLS server. |
 | 🕸️ **Decentralized overlay** | libp2p **Gossipsub** (Strict signing + scoring), **private Kademlia**, identify/ping, and the NAT trio (**AutoNAT v2 / Circuit Relay v2 / DCUtR**) — all running *over* the obfs carrier. |
+| 🔒 **End-to-end sealed topics** | With a shared 32-byte topic key, gossip payloads are **XChaCha20-Poly1305-encrypted end to end** (AAD-bound to topic/sender/seqno/timestamp) and blobs are stored and served as ciphertext (`Cid` over the ciphertext): forwarders and serving peers validate, relay and serve them **without being able to read them**. Topics without a key stay public — readable by every forwarding peer. |
 | ✍️ **Signed gossip + replay protection** | Ed25519-signed, content-addressed messages with monotonic seqno, timestamp window, and an LRU dedup guard. Forgeries and replays are rejected. |
 | 📦 **Content exchange & sync** | Content-addressed store + request/response blobs (`BLAKE3(bytes) == Cid`) and **negentropy-style set reconciliation**. |
 | 📈 **Observable & light** | Opt-in, loopback-only Prometheus `/metrics` + provisioned Grafana; **~4 MB RSS** per leaf node, tunable Tokio worker pool (`UMESH_WORKERS`). |
@@ -102,7 +103,7 @@ sequenceDiagram
 
 | Crate | Role |
 |-------|------|
-| [`umesh-crypto`](crates/umesh-crypto) | Pure-Rust crypto core (`#![forbid(unsafe_code)]`): hybrid X25519+ML-KEM-768 KEM (X-Wing-style BLAKE3 combiner), Ed25519 identity (`PeerId = BLAKE3(pubkey)`), BLAKE3 hash/KDF/keyed-MAC/CID with domain separation, XChaCha20-Poly1305, Merkle, PoW. KATs + property tests. |
+| [`umesh-crypto`](crates/umesh-crypto) | Pure-Rust crypto core (`#![forbid(unsafe_code)]`): hybrid X25519+ML-KEM-768 **X-Wing** KEM (draft-11, KAT-verified), Ed25519 identity (`PeerId = BLAKE3(pubkey)`), BLAKE3 hash/KDF/keyed-MAC/CID with domain separation, XChaCha20-Poly1305, Merkle, PoW. KATs + property tests. |
 | [`umesh-obfs`](crates/umesh-obfs) | Pluggable obfuscation carrier: TLS-1.3 ClientHello/ServerHello mimicry handshake with a `session_id` MAC gate, AEAD record stream, length-hiding padding + traffic shaping, environment profiles, `ObfsTcp` + connect-time rotation, REALITY-style fallback. DPI-simulation tests. |
 | [`umesh-p2p`](crates/umesh-p2p) | libp2p mesh: signed gossip + replay protection, `MeshBehaviour` (Gossipsub Strict, private Kademlia, identify, ping) + NAT trio (AutoNAT v2 / Relay v2 / DCUtR) + blob request/response (bincode codec) + negentropy-style reconciliation, content-addressed `ContentStore`, `MeshNode` driver, Prometheus metrics. |
 | [`umesh-node`](crates/umesh-node) | Node orchestration: config, identity keystore (`0600`), runtime, secret-free status. |
@@ -115,7 +116,7 @@ git clone https://github.com/AlexMelanFromRingo/uber-mesh
 cd uber-mesh
 
 cargo build --workspace
-cargo test  --workspace        # 213 tests: KATs, property tests, DPI sim, handshake attacks, gossip/NAT/reconcile
+cargo test  --workspace        # 275 tests: KATs (incl. X-Wing), JA4, DPI sim, handshake attacks, sealed topics, gossip/NAT
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
@@ -150,6 +151,17 @@ cargo run -p uber-mesh -- --data-dir /tmp/a status --json
 curl -s 127.0.0.1:9100/metrics | grep umesh_      # peers, gossip, handshake histogram, resources
 ```
 
+The `uber-mesh/global` topic above is **public**: the heartbeats are signed, but every peer that forwards
+them can read them. To make a topic confidential end to end, give its members a shared **topic key**:
+
+```bash
+cargo run -p uber-mesh -- keys new-topic-key --out /tmp/ops.key     # 0600 file; key never printed
+cargo run -p uber-mesh -- --data-dir /tmp/a mesh --topic ops --topic-key-file /tmp/ops.key --psk-file /tmp/a.psk …
+```
+
+Forwarders without the key still validate and relay `ops` messages but cannot read them (they see the
+topic name, sender, sizes and timing); see `contracts/message-wire.md` "Sealed messages (v3)".
+
 <details>
 <summary>Environment variables</summary>
 
@@ -157,6 +169,7 @@ curl -s 127.0.0.1:9100/metrics | grep umesh_      # peers, gossip, handshake his
 |---|---|---|
 | `UMESH_WORKERS` | `2` | Tokio worker threads (`1` = current-thread runtime; lower = lighter footprint). |
 | `UMESH_PSK` | — | Obfs PSK (hex) override for `run`/`mesh`. Precedence: `--psk-file` > `--psk` (deprecated) > `UMESH_PSK` > `config.toml`. |
+| `UMESH_TOPIC_KEY` | — | Sealed-topic key (hex) for `mesh --topic`. Precedence: `--topic-key-file` > `UMESH_TOPIC_KEY` > `config.toml` `[topic_keys]`. No key ⇒ the topic is public. |
 | `UMESH_METRICS_ADDR` | *off* | Enables `/metrics` for `mesh` (same as `--metrics-addr`): `PORT` ⇒ `127.0.0.1:PORT`, or `IP:PORT`. |
 | `METRICS_PORT` | — | **Deprecated.** If set, binds `/metrics` on `127.0.0.1:PORT` only (previously on by default on `0.0.0.0`). |
 | `UMESH_SNI` | `www.cloudflare.com` | Cover-domain SNI presented in the obfs ClientHello. |
@@ -164,7 +177,8 @@ curl -s 127.0.0.1:9100/metrics | grep umesh_      # peers, gossip, handshake his
 
 </details>
 
-Fuzz the wire parsers (nightly): `cd fuzz && cargo +nightly fuzz run obfs_record` (or `message_parse`).
+Fuzz the wire parsers (nightly): `cd fuzz && cargo +nightly fuzz run obfs_record` (or `message_parse`,
+`sealed_parse`, …).
 Run a 100-node Docker cluster with Prometheus + Grafana under `tc-netem`: `NODES=100 bash docker/run-cluster.sh`
 (generates a per-run PSK and Grafana admin password; Prometheus/Grafana are published on `127.0.0.1` only).
 
@@ -177,8 +191,13 @@ Run a 100-node Docker cluster with Prometheus + Grafana under `tc-netem`: `NODES
   5 s header-read timeout, an 8 KiB header cap and at most 8 concurrent connections.
 - **Pass the PSK via `--psk-file` or `UMESH_PSK`.** `--psk <HEX>` still works but logs a deprecation warning:
   command-line arguments are readable by other local users (`ps`, `/proc/<pid>/cmdline`).
-- **On-disk secrets.** `identity.key` and `config.toml` (which holds the PSK) are created `0600`, the data
-  directory `0700`; the keystore refuses to read or write through symlinks. A mistyped `profile` in
+- **Public vs sealed topics.** Link encryption ends at every hop. A topic without a topic key is public to
+  every peer that forwards it; seal topics that carry anything confidential (`--topic-key-file`,
+  `UMESH_TOPIC_KEY` or `config.toml` `[topic_keys]`). Anyone holding a topic key reads the whole topic, past
+  and future — rotate it out of band to remove a member.
+- **On-disk secrets.** `identity.key` and `config.toml` (which holds the PSK and any topic keys) are created `0600`, the data
+  directory `0700`; the keystore refuses to read or write through symlinks. `identity.pow` (the public
+  identity proof-of-work nonce) sits next to the key; if it is missing it is re-mined on start. A mistyped `profile` in
   `config.toml` / `--profile` is now an error instead of silently running as `moderate`.
 - **Docker.** The image runs as uid 10001; bench containers start as root only to apply `tc-netem`
   (`NET_ADMIN`) and then drop privileges. Base images are pinned by tag + digest.
@@ -202,7 +221,8 @@ pluggable transport seam. The table is about *ideas and posture*, not a benchmar
 > uber-mesh's TLS mimicry is *structurally* valid (it defeats record-type and TLS-state-machine analysis and
 > blends with real X25519MLKEM768 traffic). It is **not yet** a byte-exact uTLS JA3/JA4 fingerprint of a
 > specific browser, nor a full TLS-1.3 transcript — closing that is the deferred native-REALITY work. See
-> [`docs/security-and-deferred.md`](docs/security-and-deferred.md).
+> [`docs/security-and-deferred.md`](docs/security-and-deferred.md); who sees what, evidence levels and
+> requirement → test traceability: [`docs/threat-model.md`](docs/threat-model.md).
 
 ## Validation & benchmarks
 
@@ -231,6 +251,8 @@ Harnesses exercising the **real code** beyond unit tests (single host, mid-2026;
 - **Probe resistance.** The PSK gate is a keyed BLAKE3 MAC in the TLS `session_id` (constant-time check,
   ±1-minute epoch window). Non-PSK peers get silence (obfs4 model) or a transparent cover-site proxy (REALITY model).
 - **Self-sovereign identity.** `PeerId = BLAKE3(Ed25519 pubkey)`; signatures use `verify_strict`. No CA, no registry.
+  Gossip senders carry a one-time **identity proof-of-work** (24 bits, ≈1 s at `init`) so fresh-identity
+  floods against replay state cost real compute — friction, not a barrier.
 - **No secret leakage.** PSKs, identity seeds, and session keys are zeroized on drop and never appear in logs,
   status, errors, or metrics (only fingerprints). On-disk secrets are `0600`.
 - **Memory safety.** `unsafe_code = "deny"` workspace-wide; `#![forbid(unsafe_code)]` in `umesh-crypto`.
@@ -247,7 +269,7 @@ crates/
   umesh-obfs     obfuscation carrier (TLS-mimicry handshake, AEAD record stream, shaping, profiles)
   umesh-p2p      libp2p mesh overlay (gossip, Kademlia, NAT, blobs, reconciliation) over the obfs carrier
   umesh-node     config, keystore, node orchestration, status
-  uber-mesh      the CLI (init / run / mesh / status / keys show)
+  uber-mesh      the CLI (init / run / mesh / status / keys show|new-topic-key)
 fuzz/            standalone nightly libFuzzer harnesses (excluded from the workspace)
 docker/          scalable Docker cluster + Prometheus + Grafana + tc-netem runner
 docs/            benchmarks, security-and-deferred, research dossier
@@ -272,14 +294,14 @@ The full design lives under [`specs/001-uber-mesh-core/`](specs/001-uber-mesh-co
 
 ## Roadmap
 
-**Implemented & tested** — crypto core · obfs carrier with TLS-1.3 ClientHello mimicry, probe resistance &
-REALITY-style fallback · profiles / shaping / rotation · obfs **under libp2p Noise** (mesh inherits DPI
+**Implemented & tested** — crypto core (X-Wing, KAT-verified) · obfs carrier with an exact Chrome-133
+ClientHello (JA4-verified), cover-site server-flight mimicry, probe resistance & REALITY-style fallback ·
+sealed (end-to-end encrypted) topics + encrypted blobs · identity PoW · profiles / shaping / rotation · obfs **under libp2p Noise** (mesh inherits DPI
 resistance) · Gossipsub + private Kademlia + AutoNAT/Relay/DCUtR · signed gossip + replay protection ·
 content exchange + set reconciliation · Prometheus metrics + Grafana · node + CLI · Docker validation.
 
 **Deferred by design** (additive behind the `ObfsTransport` seam; rationale in
-[`docs/security-and-deferred.md`](docs/security-and-deferred.md)): byte-exact uTLS JA3/JA4 + full-transcript
-native REALITY (needs a ClientHello-controlling TLS stack), QUIC + Salamander (needs `quinn` UDP access),
+[`docs/security-and-deferred.md`](docs/security-and-deferred.md)): QUIC + Salamander (needs `quinn` UDP access),
 AmneziaWG (needs a WireGuard core), and a local-RF blackout tier (needs radio hardware). Tracked in
 [`specs/001-uber-mesh-core/tasks.md`](specs/001-uber-mesh-core/tasks.md); release history in
 [`CHANGELOG.md`](CHANGELOG.md).

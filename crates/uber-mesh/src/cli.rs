@@ -55,6 +55,8 @@ pub enum Command {
         #[arg(long)]
         topic: Option<String>,
         #[command(flatten)]
+        topic_key: TopicKeyArgs,
+        #[command(flatten)]
         psk: PskArgs,
         /// Enable the Prometheus /metrics endpoint (OFF by default). A bare PORT binds 127.0.0.1;
         /// give IP:PORT to bind elsewhere. Unauthenticated: it identifies the host as an uber-mesh
@@ -66,10 +68,16 @@ pub enum Command {
         #[arg(long)]
         profile: Option<String>,
         /// Cover site (`host:port`) that unauthenticated probes are transparently proxied to, so a
-        /// prober of this listener talks to a genuine HTTPS server. Default: silent close.
+        /// prober of this listener talks to a genuine HTTPS server; the listener also learns and
+        /// reproduces that site's real TLS server-flight layout. Default: silent close.
         /// Env: UMESH_FALLBACK.
         #[arg(long, value_name = "HOST:PORT")]
         fallback: Option<String>,
+        /// Cohort cover domain: the SNI this node sends when dialing and the domain whose flight a
+        /// listener mimics (defaults to the --fallback host). Every node of a cohort should use the
+        /// same value. Env: UMESH_COVER_DOMAIN.
+        #[arg(long, value_name = "DOMAIN")]
+        cover_domain: Option<String>,
     },
     /// Show node status (peers, transports, reachability) — never reveals secrets.
     Status,
@@ -94,9 +102,29 @@ pub struct PskArgs {
     pub psk: Option<String>,
 }
 
+/// Source for the `mesh --topic` sealed-topic key (32 bytes hex) overriding `config.toml`
+/// `[topic_keys]`. Without any key the topic is **public**: every forwarding peer can read it.
+///
+/// Precedence: `--topic-key-file` > `UMESH_TOPIC_KEY` env > `config.toml` `topic_keys[<topic>]`.
+/// There is deliberately no argv form (it would be visible in `ps`).
+#[derive(Args, Debug, Default)]
+pub struct TopicKeyArgs {
+    /// Read the topic key (hex, 32 bytes) from a file (e.g. a Docker/K8s secret); seals the topic
+    /// end to end. Create one with `keys new-topic-key --out <PATH>`.
+    #[arg(long, value_name = "PATH")]
+    pub topic_key_file: Option<PathBuf>,
+}
+
 /// `keys` subcommands.
 #[derive(Subcommand, Debug)]
 pub enum KeysCmd {
     /// Show the PeerId and public key (no secret material).
     Show,
+    /// Generate a fresh random sealed-topic key and write it (hex) to a new owner-only (`0600`)
+    /// file. The key is never printed; share the file out of band with the topic's members.
+    NewTopicKey {
+        /// Where to write the key (must not exist).
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+    },
 }

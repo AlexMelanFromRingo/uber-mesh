@@ -46,15 +46,16 @@ client**. A wrong-PSK peer fails the obfs gate and never reaches Noise.
 
 | Concern | What it provides | Where |
 |---|---|---|
-| Hybrid KEM | X25519 + ML-KEM-768 with an **X-Wing-style BLAKE3 combiner**; `Initiator::start` / `respond` / `Initiator::finish` return a shared secret. | `kem.rs` |
+| Hybrid KEM | **X-Wing** (X25519 + ML-KEM-768, SHA3-256 combiner, SHAKE256 seed keygen) per `draft-connolly-cfrg-xwing-kem-11`, **KAT-verified** byte-for-byte against the draft's official vectors (`tests/xwing_kat.rs`); `Initiator::start` / `respond` / `Initiator::finish` return a shared secret. | `kem.rs` |
 | Identity | Ed25519 keypair; `PeerId = BLAKE3(verifying_key)`; verification uses `verify_strict`. | `identity.rs` |
 | Hashing & KDF | BLAKE3 `hash`, `derive_key(label, ikm)`, `keyed_mac(key, data)`, and `Cid` — all with **strict domain-separation labels** (one label per use: traffic keys, obfs frame/MAC, CID, PoW, …). | `hash.rs` |
 | AEAD | XChaCha20-Poly1305 (`AeadKey`, `seal`/`open`). | `aead.rs` |
 | Integrity | RFC 9162 Merkle trees with distinct leaf/node/root labels (root commits to the tree size); proof-of-work. | `merkle.rs`, `pow.rs` |
 
 The PQ half is treated as **defense-in-depth, not authority**: the classical X25519 secret is always mixed
-in, so a break of ML-KEM-768 alone cannot recover a session key. KATs (BLAKE3 empty-input, RFC 7748 §5.2
-X25519, hybrid agreement) live in [`tests/kat.rs`](crates/umesh-crypto/tests/kat.rs); property tests
+in, so a break of ML-KEM-768 alone cannot recover a session key. KATs: the official X-Wing draft-11
+vectors in [`tests/xwing_kat.rs`](crates/umesh-crypto/tests/xwing_kat.rs), plus BLAKE3 empty-input and
+RFC 7748 §5.2 X25519 in [`tests/kat.rs`](crates/umesh-crypto/tests/kat.rs); property tests
 (AEAD round-trip + bit-flip, CID determinism, Merkle membership) in
 [`tests/props.rs`](crates/umesh-crypto/tests/props.rs).
 
@@ -90,22 +91,28 @@ real libp2p overlay and serves Prometheus `/metrics`.
 
 ## Wire format: the obfs handshake
 
-The handshake is **obfs wire v2** (normative spec:
+The handshake is **obfs wire v2.1** (normative spec:
 [`contracts/handshake-wire.md`](specs/001-uber-mesh-core/contracts/handshake-wire.md)). On the wire it is a
 complete-looking PQ TLS 1.3 opening:
 
 | Flight | Wire | What it really carries |
 |---|---|---|
-| ClientHello (`0x16`) | Chrome-stable template: GREASE, 15 suites, full extension set shuffled per connection, GREASE ECH, per-connection cover SNI; `key_share` = `X25519MLKEM768` (`0x11EC`, 1216 B) + a decoy X25519 share | our hybrid KEM material; `session_id` = keyed MAC over the **whole** ClientHello (session_id zeroed) — 32 random-looking bytes, no cleartext epoch |
-| ServerHello + CCS + `0x17` records (2.5–5 KB) | looks like ServerHello + encrypted EncryptedExtensions/Certificate/… | `0x11EC` server share (ct 1088 ‖ x25519 32); the last 53 B of the flight = AEAD **server key confirmation** |
-| CCS + `0x17` (53 B, Finished-sized) | looks like the client Finished | AEAD **client key confirmation** |
+| ClientHello (`0x16`) | **exactly** desktop Chrome 133+ (JA4 `t13d1516h2_8daaf6152771_d8a2da3f94cd`): GREASE, 15 suites, 16 extensions permuted per connection, GREASE ECH; SNI = the listener's cover domain; `key_share` = `X25519MLKEM768` (`0x11EC`, 1216 B) + an X25519 share | our hybrid KEM material; `session_id` = keyed MAC over the **whole** ClientHello (session_id zeroed) — 32 random-looking bytes, no cleartext epoch |
+| ServerHello + [CCS] + `0x17` records | **the cover site's own layout** (cover mode): same ServerHello suite/group/length, CCS presence and record sizes the real site sends to this ClientHello; else a PSK-derived default | server KEM share (in the ServerHello, or masked at the start of the flight when the cover picks plain x25519); the last 53 B of the last record = AEAD **server key confirmation** |
+| CCS + `0x17` (Finished-sized for the suite: 53/69 B) | looks like the client Finished | AEAD **client key confirmation** |
+
+**Cover profile.** In cover mode (`ProbeResponse::Cover`) the listener connects to its cover site with our own
+Chrome ClientHello at startup and every 30 min ± 5 min, records the real flight's record layout
+(`umesh-obfs::cover`), keeps the last good one on failure, and reproduces it for authenticated clients; the
+client accepts any layout within 8 records / 32 KiB and trial-opens the tail of each record to find the
+confirmation.
 
 **Gate & probe resistance.** The server checks the MAC for epochs e−1, e, e+1 in constant time and rejects
 replays via a bounded per-epoch cache. Anything that fails — non-TLS bytes, a wrong MAC, a replay — gets the
 configured probe response: silence, or a transparent reverse proxy to a real cover site that receives
 **every byte already read** (REALITY/ShadowTLS model).
 
-**Key schedule.** `transcript = H(ClientHello ‖ ServerHello)`,
+**Key schedule.** `transcript = H(ClientHello ‖ ServerHello [‖ in-flight ML-KEM ct])`,
 `master = KDF(ss_hybrid ‖ KDF(psk) ‖ transcript)`; confirmations, the two directional traffic keys and a
 public **channel binding** are separate labelled derivations of `master`. The client sends nothing after the
 ClientHello until the server's confirmation verifies, so a man-in-the-middle without the PSK learns nothing
@@ -117,7 +124,7 @@ sequenceDiagram
     participant S as Server (PSK)
     C->>S: ClientHello(0x16): key_share=X25519MLKEM768+x25519, session_id=MAC_psk(CH)
     alt gate passes (PSK holder, fresh, not a replay)
-        S->>C: ServerHello + CCS + 0x17 records (server confirmation inside)
+        S->>C: ServerHello + [CCS] + 0x17 records in the cover site's layout (confirmation in the last)
         Note over C: abort unless the server confirmation verifies
         C->>S: CCS + 0x17 Finished-sized (client confirmation)
         C-->>S: Application-Data (0x17) — Noise handshake, then mesh traffic
@@ -126,9 +133,15 @@ sequenceDiagram
     end
 ```
 
-**Residual gaps:** not a byte-exact JA3/JA4 of one specific Chrome build; the fake certificate flight would
-not survive a censor that terminates or validates TLS; no NewSessionTicket records. See
-[`docs/security-and-deferred.md`](docs/security-and-deferred.md).
+**TLS-terminating middlebox.** A full MITM (CA trusted by the client device) must send its own ClientHello,
+which fails the gate and is proxied to the real cover site — the bridge looks exactly like the cover. Our
+client finds no confirmation in the MITM's flight and fails closed without sending anything after its hello.
+No tunnel survives a full MITM: the guarantee is non-identification of the bridge, not reachability.
+
+**Residual gaps:** one Chrome generation/platform is imitated; the cover domain does not resolve to the bridge
+IP; one layout sample per refresh (real per-connection variance is not reproduced) and unauthenticated
+learning; no NewSessionTicket records. See [`contracts/handshake-wire.md`](specs/001-uber-mesh-core/contracts/handshake-wire.md)
+and [`docs/security-and-deferred.md`](docs/security-and-deferred.md).
 
 ### The AEAD record stream
 
@@ -149,6 +162,13 @@ counter desync fails decryption (tested).
 - **Content addressing.** A `Cid` is `BLAKE3` over the content; blob transfers verify `BLAKE3(bytes) == cid`
   on receipt, and **negentropy-style range-based set reconciliation** lets two peers efficiently discover
   which content each is missing.
+- **End-to-end sealed topics (`umesh-p2p::sealed`).** Link encryption (obfs + Noise) ends at every hop, so
+  forwarders and serving peers would otherwise read what they relay. A topic with a shared 32-byte topic key
+  carries format-v3 messages whose payload is XChaCha20-Poly1305 ciphertext under a per-epoch key derived
+  from `(topic_key, topic)`, AAD-bound to version/topic/sender/seqno/timestamp; the signature covers the
+  ciphertext, so non-members still validate and forward but never deliver. Blobs shared in a sealed topic
+  are encrypted under a fresh content key with `Cid` over the ciphertext; `(cid, key)` travels inside a sealed
+  message. Topics without a key stay public (v2).
 
 ## Data flow: a gossip message, end to end
 

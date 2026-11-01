@@ -32,6 +32,10 @@ blake3 = "1.8"
 ed25519-dalek = { version = "2.2", features = ["rand_core", "zeroize"] }
 x25519-dalek = { version = "2", features = ["zeroize", "static_secrets"] }
 ml-kem = { version = "0.3", features = ["getrandom"] }
+# X-Wing combiner (SHA3-256) and seed expansion (SHAKE256). RustCrypto split SHAKE out of `sha3`
+# 0.12 into `shake` 0.1; both are already in the tree via `ml-kem` 0.3, so no new crates are pulled.
+sha3 = { version = "0.12", default-features = false }
+shake = { version = "0.1", default-features = false }
 chacha20poly1305 = { version = "0.11", features = ["alloc"] }
 rand = "0.8"
 # NB: bincode 3.0.0 is a protest/troll release that refuses to compile (compile_error!); 2.x is the

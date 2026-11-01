@@ -346,6 +346,7 @@ impl Node {
             listen: self.config.listen.clone(),
             bootstrap: self.config.bootstrap.clone(),
             psk_fingerprint: self.config.psk_fingerprint(),
+            sealed_topics: self.config.sealed_topics(),
             transports,
             peers: PeerCounts {
                 connected: st.connected.len(),

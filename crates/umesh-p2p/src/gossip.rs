@@ -1,10 +1,10 @@
 //! Signed gossip messages + replay protection (contracts/message-wire.md).
 //!
 //! Every message is authenticated to its sender and content-addressed. Validation has a stateless
-//! part (identity binding, signature, payload hash, topic binding) and a stateful part (per-sender
-//! sliding replay window, timestamp window, bounded dedup) — gossipsub's own dedup does NOT survive
-//! cache eviction, so replay protection is enforced here at the application layer (research D10 /
-//! mesh-integrity). All stateful structures are bounded and expire, since remote peers pick the keys.
+//! part (identity binding, identity proof-of-work, signature, payload hash, topic binding) and a
+//! stateful part (per-sender sliding replay window, timestamp window, bounded dedup) — gossipsub's
+//! own dedup does NOT survive cache eviction, so replay protection is enforced here at the
+//! application layer (research D10 / mesh-integrity). All stateful structures are bounded and expire, since remote peers pick the keys.
 
 use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,12 +12,26 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use umesh_crypto::hash::{self, Hash32};
 use umesh_crypto::identity::{self, NodeIdentity, PeerId};
+use umesh_crypto::pow;
 
 use crate::bounded::BoundedMap;
 
-/// Message format version.
-pub const MSG_VERSION: u8 = 1;
-const SIG_LABEL: &[u8] = b"uber-mesh-msg-v1";
+/// Message format version of a **public** message. v2 (0.10.0) added the sender's identity
+/// proof-of-work nonce; v1 messages are `Ignore`d (never penalized), like any other unknown version.
+pub const MSG_VERSION: u8 = 2;
+/// Message format version of a **sealed** (end-to-end encrypted) message: the v2 layout, but the
+/// payload is `nonce(24) ‖ XChaCha20-Poly1305(ciphertext ‖ tag)` under the topic's key (see
+/// [`crate::sealed`]). Signed under a distinct label, so a forwarder cannot flip the version byte.
+pub const SEALED_MSG_VERSION: u8 = 3;
+const SIG_LABEL: &[u8] = b"uber-mesh-msg-v2";
+const SEALED_SIG_LABEL: &[u8] = b"uber-mesh-msg-v3";
+/// Smallest valid sealed payload: a 24-byte nonce and a 16-byte tag (empty plaintext).
+pub const MIN_SEALED_PAYLOAD: usize = umesh_crypto::aead::NONCE_LEN + umesh_crypto::aead::TAG_LEN;
+/// Network-wide minimum identity proof-of-work (leading zero bits of
+/// [`umesh_crypto::pow::identity_digest`]) a sender must carry. Defined once, in
+/// [`umesh_crypto::pow::MIN_SENDER_POW_BITS`]; **all nodes must agree** on it — a message below it
+/// is provably invalid (`Reject`), so changing it requires a [`MSG_VERSION`] bump.
+pub const MIN_SENDER_POW_BITS: u32 = pow::MIN_SENDER_POW_BITS;
 /// BLAKE3 `derive_key` context for message-ids. The id covers the **full canonical encoding**
 /// (including the payload), so two different byte strings can never share an id — a forged copy
 /// with a swapped payload cannot poison the gossipsub duplicate cache for the genuine message.
@@ -101,6 +115,9 @@ pub enum MsgError {
     /// The signed topic differs from the gossipsub topic the message arrived on.
     #[error("signed topic does not match delivery topic")]
     TopicMismatch,
+    /// The sender identity's proof-of-work nonce is below the required difficulty.
+    #[error("insufficient sender identity proof-of-work")]
+    InsufficientPow,
 }
 
 impl MsgError {
@@ -118,40 +135,55 @@ impl MsgError {
 }
 
 /// A signed, content-addressed gossip message.
+///
+/// Public (v2) messages carry the application bytes in `payload`. Sealed (v3) messages carry the
+/// AEAD ciphertext there instead: `payload_hash` and `sig` cover the **ciphertext**, so every
+/// forwarder can still check identity binding, PoW, signature and replay state — and forward the
+/// message — without being able to read it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignedMessage {
+    /// `true` for a sealed (v3, end-to-end encrypted) message, `false` for a public (v2) one.
+    pub sealed: bool,
     /// Topic id.
     pub topic: String,
     /// Sender PeerId (`BLAKE3(sender_key)`).
     pub sender: [u8; 32],
     /// Sender Ed25519 verifying key.
     pub sender_key: [u8; 32],
+    /// Identity proof-of-work nonce: `pow::identity_digest(sender_key, pow_nonce)` must have at
+    /// least [`MIN_SENDER_POW_BITS`] leading zero bits. Mined once per identity; signed.
+    pub pow_nonce: u64,
     /// Per-sender sequence number (time-based: `max(last + 1, now_µs)`).
     pub seqno: u64,
     /// Unix-millis timestamp.
     pub timestamp: u64,
     /// `BLAKE3(payload)`.
     pub payload_hash: Hash32,
-    /// Application payload.
+    /// Application payload (public) or `nonce ‖ ciphertext ‖ tag` (sealed).
     pub payload: Vec<u8>,
     /// Ed25519 signature over the transcript.
     pub sig: [u8; 64],
 }
 
+#[allow(clippy::too_many_arguments)]
 fn transcript(
+    sealed: bool,
     topic: &str,
     sender: &[u8; 32],
     sender_key: &[u8; 32],
+    pow_nonce: u64,
     seqno: u64,
     timestamp: u64,
     payload_hash: &Hash32,
 ) -> Vec<u8> {
-    let mut t = Vec::with_capacity(SIG_LABEL.len() + 2 + topic.len() + 32 + 32 + 8 + 8 + 32);
-    t.extend_from_slice(SIG_LABEL);
+    let label = if sealed { SEALED_SIG_LABEL } else { SIG_LABEL };
+    let mut t = Vec::with_capacity(label.len() + 2 + topic.len() + 32 + 32 + 8 + 8 + 8 + 32);
+    t.extend_from_slice(label);
     t.extend_from_slice(&(topic.len() as u16).to_le_bytes());
     t.extend_from_slice(topic.as_bytes());
     t.extend_from_slice(sender);
     t.extend_from_slice(sender_key);
+    t.extend_from_slice(&pow_nonce.to_le_bytes());
     t.extend_from_slice(&seqno.to_le_bytes());
     t.extend_from_slice(&timestamp.to_le_bytes());
     t.extend_from_slice(payload_hash);
@@ -159,9 +191,52 @@ fn transcript(
 }
 
 impl SignedMessage {
-    /// Build and sign a message from this node's identity.
+    /// Build and sign a message from an identity **without** a proof-of-work (`pow_nonce = 0`).
+    ///
+    /// Such a message fails validation at [`MIN_SENDER_POW_BITS`] (except with probability
+    /// `2^-MIN_SENDER_POW_BITS`); it exists for low-level tests of the other checks. Real senders
+    /// use [`SignedMessage::create_with_pow`] (as [`crate::MeshNode::publish`] does).
     pub fn create(
         id: &NodeIdentity,
+        topic: &str,
+        payload: Vec<u8>,
+        seqno: u64,
+        timestamp: u64,
+    ) -> Self {
+        Self::create_with_pow(id, 0, topic, payload, seqno, timestamp)
+    }
+
+    /// Build and sign a message from an identity and its mined proof-of-work nonce (see
+    /// [`umesh_crypto::pow::mine_identity`]). The nonce is covered by the signature.
+    pub fn create_with_pow(
+        id: &NodeIdentity,
+        pow_nonce: u64,
+        topic: &str,
+        payload: Vec<u8>,
+        seqno: u64,
+        timestamp: u64,
+    ) -> Self {
+        Self::sign(id, pow_nonce, false, topic, payload, seqno, timestamp)
+    }
+
+    /// Build and sign a **sealed** (v3) message whose `ciphertext` is already sealed for exactly
+    /// this `(topic, sender, seqno, timestamp)` — use [`crate::sealed::seal_message`], which picks
+    /// the seqno/timestamp, binds them into the AEAD associated data and calls this.
+    pub fn create_sealed_with_pow(
+        id: &NodeIdentity,
+        pow_nonce: u64,
+        topic: &str,
+        ciphertext: Vec<u8>,
+        seqno: u64,
+        timestamp: u64,
+    ) -> Self {
+        Self::sign(id, pow_nonce, true, topic, ciphertext, seqno, timestamp)
+    }
+
+    fn sign(
+        id: &NodeIdentity,
+        pow_nonce: u64,
+        sealed: bool,
         topic: &str,
         payload: Vec<u8>,
         seqno: u64,
@@ -170,12 +245,23 @@ impl SignedMessage {
         let sender = *id.peer_id().as_bytes();
         let sender_key = id.verifying_key().to_bytes();
         let payload_hash = hash::hash(&payload);
-        let t = transcript(topic, &sender, &sender_key, seqno, timestamp, &payload_hash);
+        let t = transcript(
+            sealed,
+            topic,
+            &sender,
+            &sender_key,
+            pow_nonce,
+            seqno,
+            timestamp,
+            &payload_hash,
+        );
         let sig = id.sign_bytes(&t);
         SignedMessage {
+            sealed,
             topic: topic.to_string(),
             sender,
             sender_key,
+            pow_nonce,
             seqno,
             timestamp,
             payload_hash,
@@ -186,9 +272,11 @@ impl SignedMessage {
 
     fn transcript(&self) -> Vec<u8> {
         transcript(
+            self.sealed,
             &self.topic,
             &self.sender,
             &self.sender_key,
+            self.pow_nonce,
             self.seqno,
             self.timestamp,
             &self.payload_hash,
@@ -201,10 +289,21 @@ impl SignedMessage {
         message_id_of(&self.encode())
     }
 
-    /// Stateless validation: identity binding, signature, payload hash. Returns the bound PeerId.
+    /// Stateless validation at the network-wide [`MIN_SENDER_POW_BITS`]: identity binding,
+    /// identity proof-of-work, payload hash, signature. Returns the bound PeerId.
     pub fn validate_stateless(&self) -> Result<PeerId, MsgError> {
+        self.validate_stateless_with_pow(MIN_SENDER_POW_BITS)
+    }
+
+    /// [`SignedMessage::validate_stateless`] with an explicit PoW difficulty. Anything other than
+    /// [`MIN_SENDER_POW_BITS`] is for tests/isolated devnets only (see [`validate_with_pow`]).
+    pub fn validate_stateless_with_pow(&self, min_pow_bits: u32) -> Result<PeerId, MsgError> {
         if hash::hash(&self.sender_key) != self.sender {
             return Err(MsgError::IdentityBinding);
+        }
+        // One BLAKE3 call, checked before the (expensive) signature: work bound to this key.
+        if !pow::verify_identity(&self.sender_key, self.pow_nonce, min_pow_bits) {
+            return Err(MsgError::InsufficientPow);
         }
         if hash::hash(&self.payload) != self.payload_hash {
             return Err(MsgError::PayloadHash);
@@ -216,13 +315,14 @@ impl SignedMessage {
     /// Canonical wire encoding.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(
-            1 + 2 + self.topic.len() + 32 + 32 + 8 + 8 + 32 + 4 + self.payload.len() + 64,
+            1 + 2 + self.topic.len() + 32 + 32 + 8 + 8 + 8 + 32 + 4 + self.payload.len() + 64,
         );
-        out.push(MSG_VERSION);
+        out.push(self.version());
         out.extend_from_slice(&(self.topic.len() as u16).to_le_bytes());
         out.extend_from_slice(self.topic.as_bytes());
         out.extend_from_slice(&self.sender);
         out.extend_from_slice(&self.sender_key);
+        out.extend_from_slice(&self.pow_nonce.to_le_bytes());
         out.extend_from_slice(&self.seqno.to_le_bytes());
         out.extend_from_slice(&self.timestamp.to_le_bytes());
         out.extend_from_slice(&self.payload_hash);
@@ -232,18 +332,32 @@ impl SignedMessage {
         out
     }
 
+    /// Wire version byte: [`MSG_VERSION`] (public) or [`SEALED_MSG_VERSION`] (sealed).
+    pub fn version(&self) -> u8 {
+        if self.sealed {
+            SEALED_MSG_VERSION
+        } else {
+            MSG_VERSION
+        }
+    }
+
     /// Parse a message from its canonical encoding. Never panics on arbitrary input.
+    ///
+    /// A sealed (v3) message whose payload is shorter than [`MIN_SEALED_PAYLOAD`] cannot be a
+    /// valid AEAD output and is `Malformed` (checkable by every forwarder, key or not).
     pub fn decode(buf: &[u8]) -> Result<Self, MsgError> {
         let mut c = Cursor { buf, pos: 0 };
-        let v = c.u8()?;
-        if v != MSG_VERSION {
-            return Err(MsgError::Version);
-        }
+        let sealed = match c.u8()? {
+            MSG_VERSION => false,
+            SEALED_MSG_VERSION => true,
+            _ => return Err(MsgError::Version),
+        };
         let topic_len = c.u16()? as usize;
         let topic =
             String::from_utf8(c.take(topic_len)?.to_vec()).map_err(|_| MsgError::Malformed)?;
         let sender = c.arr32()?;
         let sender_key = c.arr32()?;
+        let pow_nonce = c.u64()?;
         let seqno = c.u64()?;
         let timestamp = c.u64()?;
         let payload_hash = c.arr32()?;
@@ -253,10 +367,15 @@ impl SignedMessage {
         if c.pos != buf.len() {
             return Err(MsgError::Malformed); // trailing bytes
         }
+        if sealed && payload.len() < MIN_SEALED_PAYLOAD {
+            return Err(MsgError::Malformed);
+        }
         Ok(SignedMessage {
+            sealed,
             topic,
             sender,
             sender_key,
+            pow_nonce,
             seqno,
             timestamp,
             payload_hash,
@@ -488,13 +607,25 @@ impl Default for ReplayGuard {
     }
 }
 
-/// Full validation pipeline: stateless checks then stateful anti-replay. Returns the sender PeerId.
+/// Full validation pipeline at the network-wide [`MIN_SENDER_POW_BITS`]: stateless checks then
+/// stateful anti-replay. Returns the sender PeerId.
 pub fn validate(
     msg: &SignedMessage,
     guard: &mut ReplayGuard,
     now_ms: u64,
 ) -> Result<PeerId, MsgError> {
-    let peer = msg.validate_stateless()?;
+    validate_with_pow(msg, guard, now_ms, MIN_SENDER_POW_BITS)
+}
+
+/// [`validate`] with an explicit sender-PoW difficulty. **Tests / isolated devnets only**: a node
+/// accepting less than its peers relays messages they `Reject`, and gets penalized for it.
+pub fn validate_with_pow(
+    msg: &SignedMessage,
+    guard: &mut ReplayGuard,
+    now_ms: u64,
+    min_pow_bits: u32,
+) -> Result<PeerId, MsgError> {
+    let peer = msg.validate_stateless_with_pow(min_pow_bits)?;
     guard.accept(msg, now_ms)?;
     Ok(peer)
 }
@@ -507,22 +638,206 @@ pub fn validate_on_topic(
     guard: &mut ReplayGuard,
     now_ms: u64,
 ) -> Result<PeerId, MsgError> {
+    validate_on_topic_with_pow(msg, delivered_topic, guard, now_ms, MIN_SENDER_POW_BITS)
+}
+
+/// [`validate_on_topic`] with an explicit sender-PoW difficulty (tests / devnets only, see
+/// [`validate_with_pow`]).
+pub fn validate_on_topic_with_pow(
+    msg: &SignedMessage,
+    delivered_topic: &str,
+    guard: &mut ReplayGuard,
+    now_ms: u64,
+    min_pow_bits: u32,
+) -> Result<PeerId, MsgError> {
     if msg.topic != delivered_topic {
         return Err(MsgError::TopicMismatch);
     }
-    validate(msg, guard, now_ms)
+    validate_with_pow(msg, guard, now_ms, min_pow_bits)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Unit tests exercise the replay/format logic with cheap identities: 8-bit PoW (~256 hashes).
+    /// The network minimum itself is covered by `network_minimum_pow_*` with pre-mined identities.
+    const TEST_POW: u32 = 8;
+
+    /// Least nonce meeting [`TEST_POW`] for `id` (deterministic).
+    fn test_nonce(id: &NodeIdentity) -> u64 {
+        let key = id.verifying_key().to_bytes();
+        (0u64..)
+            .find(|&n| pow::verify_identity(&key, n, TEST_POW))
+            .unwrap()
+    }
+
+    /// Sign with a valid (test-difficulty) identity PoW.
+    fn signed(
+        id: &NodeIdentity,
+        topic: &str,
+        payload: Vec<u8>,
+        seqno: u64,
+        ts: u64,
+    ) -> SignedMessage {
+        SignedMessage::create_with_pow(id, test_nonce(id), topic, payload, seqno, ts)
+    }
+
+    fn tv(msg: &SignedMessage, g: &mut ReplayGuard, now_ms: u64) -> Result<PeerId, MsgError> {
+        validate_with_pow(msg, g, now_ms, TEST_POW)
+    }
+
+    fn tvt(
+        msg: &SignedMessage,
+        topic: &str,
+        g: &mut ReplayGuard,
+        now_ms: u64,
+    ) -> Result<PeerId, MsgError> {
+        validate_on_topic_with_pow(msg, topic, g, now_ms, TEST_POW)
+    }
+
     fn msg(seed: u8, seqno: u64, ts: u64, payload: &[u8]) -> (SignedMessage, NodeIdentity) {
         let id = NodeIdentity::from_seed(&[seed; 32]);
         (
-            SignedMessage::create(&id, "uber-mesh/news", payload.to_vec(), seqno, ts),
+            signed(&id, "uber-mesh/news", payload.to_vec(), seqno, ts),
             id,
         )
+    }
+
+    /// Identities pre-mined at the network minimum (least nonce, one worker), so tests can check
+    /// the real [`MIN_SENDER_POW_BITS`] without mining 2^24 hashes in a debug build.
+    const MINED: [(u8, u64); 2] = [(0x24, 18_566_826), (0x25, 76_581_304)];
+
+    fn mined(i: usize) -> (NodeIdentity, u64) {
+        let (seed, nonce) = MINED[i];
+        (NodeIdentity::from_seed(&[seed; 32]), nonce)
+    }
+
+    #[test]
+    fn network_minimum_pow_is_accepted() {
+        assert_eq!(
+            MIN_SENDER_POW_BITS, 24,
+            "update MINED when the network minimum changes"
+        );
+        for i in 0..MINED.len() {
+            let (id, nonce) = mined(i);
+            let m = SignedMessage::create_with_pow(&id, nonce, "t", b"x".to_vec(), 1, 1000);
+            assert_eq!(m.validate_stateless(), Ok(id.peer_id()));
+            let mut g = ReplayGuard::default();
+            assert_eq!(validate(&m, &mut g, 1000), Ok(id.peer_id()));
+            let back = SignedMessage::decode(&m.encode()).unwrap();
+            assert_eq!(back.pow_nonce, nonce);
+            assert_eq!(
+                validate_on_topic(&back, "t", &mut g, 1000),
+                Err(MsgError::Duplicate)
+            );
+        }
+    }
+
+    /// Regression: a message without proof-of-work (nonce 0 / `create`) is provably invalid.
+    #[test]
+    fn message_without_pow_is_rejected() {
+        let (id, _) = mined(0);
+        let m = SignedMessage::create(&id, "t", b"x".to_vec(), 1, 1000);
+        assert_eq!(m.pow_nonce, 0);
+        assert!(pow::identity_pow_bits(&m.sender_key, 0) < MIN_SENDER_POW_BITS);
+        assert_eq!(m.validate_stateless(), Err(MsgError::InsufficientPow));
+        let mut g = ReplayGuard::default();
+        assert_eq!(validate(&m, &mut g, 1000), Err(MsgError::InsufficientPow));
+        assert!(
+            MsgError::InsufficientPow.is_invalid(),
+            "Reject (forwarder penalized)"
+        );
+        assert_eq!(
+            g.tracked_senders(),
+            0,
+            "rejected before touching replay state"
+        );
+    }
+
+    /// Regression: work below the network minimum is rejected even though it is valid PoW at a
+    /// lower difficulty; it passes only where that lower difficulty is explicitly configured.
+    #[test]
+    fn insufficient_pow_is_rejected() {
+        let id = NodeIdentity::from_seed(&[0x31; 32]);
+        let key = id.verifying_key().to_bytes();
+        let weak = (0u64..)
+            .find(|&n| {
+                let b = pow::identity_pow_bits(&key, n);
+                (TEST_POW..MIN_SENDER_POW_BITS).contains(&b)
+            })
+            .unwrap();
+        let m = SignedMessage::create_with_pow(&id, weak, "t", b"x".to_vec(), 1, 1000);
+        assert_eq!(m.validate_stateless(), Err(MsgError::InsufficientPow));
+        assert_eq!(m.validate_stateless_with_pow(TEST_POW), Ok(id.peer_id()));
+        let mut g = ReplayGuard::default();
+        assert_eq!(
+            validate_on_topic(&m, "t", &mut g, 1000),
+            Err(MsgError::InsufficientPow)
+        );
+    }
+
+    /// Regression: a nonce is bound to the key it was mined for — B re-signing a message with A's
+    /// valid nonce is rejected, and swapping the nonce of a signed message breaks the signature.
+    #[test]
+    fn swapped_nonce_is_rejected() {
+        let ((a, a_nonce), (b, b_nonce)) = (mined(0), mined(1));
+        assert!(!pow::verify_identity(
+            &b.verifying_key().to_bytes(),
+            a_nonce,
+            MIN_SENDER_POW_BITS
+        ));
+        // B claims A's work (correctly signed by B): the work does not bind to B's key.
+        let stolen = SignedMessage::create_with_pow(&b, a_nonce, "t", b"x".to_vec(), 1, 1000);
+        assert_eq!(stolen.validate_stateless(), Err(MsgError::InsufficientPow));
+        // A forwarder swaps the nonce field of B's genuine message for A's: not B's work.
+        let mut swapped = SignedMessage::create_with_pow(&b, b_nonce, "t", b"x".to_vec(), 1, 1000);
+        assert!(swapped.validate_stateless().is_ok());
+        swapped.pow_nonce = a_nonce;
+        assert_eq!(swapped.validate_stateless(), Err(MsgError::InsufficientPow));
+        // Swapping in a *different valid* nonce for the same key is caught by the signature.
+        let key = a.verifying_key().to_bytes();
+        let n1 = test_nonce(&a);
+        let n2 = (n1 + 1..)
+            .find(|&n| pow::verify_identity(&key, n, TEST_POW))
+            .unwrap();
+        let mut m = SignedMessage::create_with_pow(&a, n1, "t", b"x".to_vec(), 1, 1000);
+        m.pow_nonce = n2;
+        assert_eq!(
+            m.validate_stateless_with_pow(TEST_POW),
+            Err(MsgError::Signature)
+        );
+        // Same through the wire encoding: flip a nonce byte in the canonical bytes.
+        let mut bytes = SignedMessage::create_with_pow(&a, a_nonce, "t", vec![1], 1, 1000).encode();
+        let nonce_at = 1 + 2 + 1 + 32 + 32; // version, topic_len, "t", sender, sender_key
+        assert_eq!(bytes[nonce_at..nonce_at + 8], a_nonce.to_le_bytes());
+        bytes[nonce_at] ^= 1;
+        let m = SignedMessage::decode(&bytes).unwrap();
+        assert!(matches!(
+            m.validate_stateless(),
+            Err(MsgError::InsufficientPow | MsgError::Signature)
+        ));
+    }
+
+    /// The v2 format bump: a v1 (pre-PoW) message — or any other version — is ignored, never
+    /// rejected, so peers on different releases do not penalize each other.
+    #[test]
+    fn old_version_is_ignored_not_rejected() {
+        assert_eq!(MSG_VERSION, 2);
+        let (m, _) = msg(1, 1, 1000, b"x");
+        let mut v1 = m.encode();
+        v1[0] = 1;
+        assert_eq!(SignedMessage::decode(&v1), Err(MsgError::Version));
+        assert!(!MsgError::Version.is_invalid());
+        // A genuine v1 layout (no nonce field) is ignored the same way.
+        let mut legacy = vec![1u8];
+        legacy.extend_from_slice(&m.encode()[1..]);
+        legacy.drain(1 + 2 + m.topic.len() + 64..1 + 2 + m.topic.len() + 72);
+        assert_eq!(SignedMessage::decode(&legacy), Err(MsgError::Version));
+        // v3 is the sealed envelope (0.10): not an unknown version. v4+ is.
+        let mut v4 = m.encode();
+        v4[0] = SEALED_MSG_VERSION + 1;
+        assert_eq!(SignedMessage::decode(&v4), Err(MsgError::Version));
     }
 
     #[test]
@@ -538,48 +853,57 @@ mod tests {
     fn valid_message_accepts_once() {
         let (m, id) = msg(2, 1, 1000, b"x");
         let mut g = ReplayGuard::new(DEFAULT_SKEW_MS, 16);
-        let peer = validate(&m, &mut g, 1000).unwrap();
+        let peer = tv(&m, &mut g, 1000).unwrap();
         assert_eq!(peer, id.peer_id());
         // Replaying the exact message is a duplicate.
-        assert_eq!(validate(&m, &mut g, 1000), Err(MsgError::Duplicate));
+        assert_eq!(tv(&m, &mut g, 1000), Err(MsgError::Duplicate));
     }
 
     #[test]
     fn tampered_payload_rejected() {
         let (mut m, _) = msg(3, 1, 1000, b"x");
         m.payload = b"y".to_vec();
-        assert_eq!(m.validate_stateless(), Err(MsgError::PayloadHash));
+        assert_eq!(
+            m.validate_stateless_with_pow(TEST_POW),
+            Err(MsgError::PayloadHash)
+        );
     }
 
     #[test]
     fn forged_sender_rejected() {
         let (mut m, _) = msg(4, 1, 1000, b"x");
         m.sender[0] ^= 0xff; // claim a different PeerId
-        assert_eq!(m.validate_stateless(), Err(MsgError::IdentityBinding));
+        assert_eq!(
+            m.validate_stateless_with_pow(TEST_POW),
+            Err(MsgError::IdentityBinding)
+        );
     }
 
     #[test]
     fn tampered_signature_rejected() {
         let (mut m, _) = msg(5, 1, 1000, b"x");
         m.sig[0] ^= 0xff;
-        assert_eq!(m.validate_stateless(), Err(MsgError::Signature));
+        assert_eq!(
+            m.validate_stateless_with_pow(TEST_POW),
+            Err(MsgError::Signature)
+        );
     }
 
     #[test]
     fn non_monotonic_seqno_rejected() {
         let id = NodeIdentity::from_seed(&[6; 32]);
-        let m1 = SignedMessage::create(&id, "t", b"a".to_vec(), 5, 1000);
-        let m2 = SignedMessage::create(&id, "t", b"b".to_vec(), 5, 1001); // same seqno
+        let m1 = signed(&id, "t", b"a".to_vec(), 5, 1000);
+        let m2 = signed(&id, "t", b"b".to_vec(), 5, 1001); // same seqno
         let mut g = ReplayGuard::new(DEFAULT_SKEW_MS, 16);
-        assert!(validate(&m1, &mut g, 1000).is_ok());
-        assert_eq!(validate(&m2, &mut g, 1001), Err(MsgError::Replay));
+        assert!(tv(&m1, &mut g, 1000).is_ok());
+        assert_eq!(tv(&m2, &mut g, 1001), Err(MsgError::Replay));
     }
 
     #[test]
     fn stale_timestamp_rejected() {
         let (m, _) = msg(7, 1, 1000, b"x");
         let mut g = ReplayGuard::new(1000, 16); // 1s window
-        assert_eq!(validate(&m, &mut g, 1_000_000), Err(MsgError::Timestamp));
+        assert_eq!(tv(&m, &mut g, 1_000_000), Err(MsgError::Timestamp));
     }
 
     /// Audit regression (msgid collision): a re-signed copy with a swapped payload used to share
@@ -590,7 +914,10 @@ mod tests {
         let mut evil = genuine.clone();
         evil.payload = b"garbage".to_vec(); // payload_hash + sig untouched
         assert_ne!(evil.message_id(), genuine.message_id());
-        assert_eq!(evil.validate_stateless(), Err(MsgError::PayloadHash));
+        assert_eq!(
+            evil.validate_stateless_with_pow(TEST_POW),
+            Err(MsgError::PayloadHash)
+        );
         // The gossipsub id fn and the typed id agree on canonical bytes.
         assert_eq!(message_id_of(&genuine.encode()), genuine.message_id());
     }
@@ -600,12 +927,12 @@ mod tests {
         let (m, _) = msg(9, 1, 1000, b"x"); // signed for "uber-mesh/news"
         let mut g = ReplayGuard::new(DEFAULT_SKEW_MS, 16);
         assert_eq!(
-            validate_on_topic(&m, "uber-mesh/other", &mut g, 1000),
+            tvt(&m, "uber-mesh/other", &mut g, 1000),
             Err(MsgError::TopicMismatch)
         );
         assert!(MsgError::TopicMismatch.is_invalid());
         // A mismatch must not consume replay state: the genuine delivery still validates.
-        assert!(validate_on_topic(&m, "uber-mesh/news", &mut g, 1000).is_ok());
+        assert!(tvt(&m, "uber-mesh/news", &mut g, 1000).is_ok());
     }
 
     #[test]
@@ -618,20 +945,21 @@ mod tests {
         assert!(MsgError::PayloadHash.is_invalid());
         assert!(MsgError::IdentityBinding.is_invalid());
         assert!(MsgError::Malformed.is_invalid());
+        assert!(MsgError::InsufficientPow.is_invalid());
     }
 
     /// Audit regression: a strict high-water mark dropped legitimately reordered messages.
     #[test]
     fn reordered_messages_accepted_once() {
         let id = NodeIdentity::from_seed(&[10; 32]);
-        let late = SignedMessage::create(&id, "t", b"a".to_vec(), 9_000, 1000);
-        let early = SignedMessage::create(&id, "t", b"b".to_vec(), 10_000, 1000);
+        let late = signed(&id, "t", b"a".to_vec(), 9_000, 1000);
+        let early = signed(&id, "t", b"b".to_vec(), 10_000, 1000);
         let mut g = ReplayGuard::new(DEFAULT_SKEW_MS, 16);
-        assert!(validate(&early, &mut g, 1000).is_ok());
-        assert!(validate(&late, &mut g, 1000).is_ok(), "reordered delivery");
+        assert!(tv(&early, &mut g, 1000).is_ok());
+        assert!(tv(&late, &mut g, 1000).is_ok(), "reordered delivery");
         // Re-signed copy of an accepted seqno (different payload ⇒ different id) is a replay.
-        let again = SignedMessage::create(&id, "t", b"c".to_vec(), 9_000, 1001);
-        assert_eq!(validate(&again, &mut g, 1001), Err(MsgError::Replay));
+        let again = signed(&id, "t", b"c".to_vec(), 9_000, 1001);
+        assert_eq!(tv(&again, &mut g, 1001), Err(MsgError::Replay));
     }
 
     #[test]
@@ -639,17 +967,17 @@ mod tests {
         let id = NodeIdentity::from_seed(&[11; 32]);
         let mut g = ReplayGuard::new(DEFAULT_SKEW_MS, 4096);
         for s in 1..=(REPLAY_WINDOW_SEQNOS as u64 + 10) {
-            let m = SignedMessage::create(&id, "t", s.to_le_bytes().to_vec(), s, 1000);
-            assert!(validate(&m, &mut g, 1000).is_ok());
+            let m = signed(&id, "t", s.to_le_bytes().to_vec(), s, 1000);
+            assert!(tv(&m, &mut g, 1000).is_ok());
         }
         // Seqno 1 fell out of the remembered set; the floor must still reject a re-signed copy.
-        let old = SignedMessage::create(&id, "t", b"replay".to_vec(), 1, 1000);
-        assert_eq!(validate(&old, &mut g, 1000), Err(MsgError::Replay));
+        let old = signed(&id, "t", b"replay".to_vec(), 1, 1000);
+        assert_eq!(tv(&old, &mut g, 1000), Err(MsgError::Replay));
         // Seqnos far behind the highest one (beyond the skew window, in µs) are stale.
-        let hi = SignedMessage::create(&id, "t", b"hi".to_vec(), 10_000_000_000, 1000);
-        assert!(validate(&hi, &mut g, 1000).is_ok());
-        let stale = SignedMessage::create(&id, "t", b"st".to_vec(), 5_000_000, 1000);
-        assert_eq!(validate(&stale, &mut g, 1000), Err(MsgError::Replay));
+        let hi = signed(&id, "t", b"hi".to_vec(), 10_000_000_000, 1000);
+        assert!(tv(&hi, &mut g, 1000).is_ok());
+        let stale = signed(&id, "t", b"st".to_vec(), 5_000_000, 1000);
+        assert_eq!(tv(&stale, &mut g, 1000), Err(MsgError::Replay));
     }
 
     #[test]
@@ -662,13 +990,13 @@ mod tests {
         let mut last = 0;
         for i in 0..3u8 {
             last = next_seqno(last, now_us);
-            let m = SignedMessage::create(&id, "t", vec![i], last, now_ms);
-            assert!(validate(&m, &mut g, now_ms).is_ok());
+            let m = signed(&id, "t", vec![i], last, now_ms);
+            assert!(tv(&m, &mut g, now_ms).is_ok());
         }
         // Restart: in-memory seqno state is gone (last = 0) but the clock moved on.
         let s = next_seqno(0, now_us + 2_000_000);
-        let m = SignedMessage::create(&id, "t", b"after restart".to_vec(), s, now_ms + 2000);
-        assert!(validate(&m, &mut g, now_ms + 2000).is_ok());
+        let m = signed(&id, "t", b"after restart".to_vec(), s, now_ms + 2000);
+        assert!(tv(&m, &mut g, now_ms + 2000).is_ok());
         assert!(next_seqno(5, 3) == 6 && next_seqno(5, 100) == 100);
     }
 
@@ -677,14 +1005,14 @@ mod tests {
         let mut g = ReplayGuard::with_limits(1000, 32, 8);
         for i in 0..100u8 {
             let id = NodeIdentity::from_seed(&[i; 32]);
-            let m = SignedMessage::create(&id, "t", vec![i], 1, 5000 + i as u64);
-            assert!(validate(&m, &mut g, 5000).is_ok());
+            let m = signed(&id, "t", vec![i], 1, 5000 + i as u64);
+            assert!(tv(&m, &mut g, 5000).is_ok());
             assert!(g.tracked_senders() <= 8 && g.tracked_ids() <= 32);
         }
         // After 2·skew everything expires on the next accept.
         let id = NodeIdentity::from_seed(&[200; 32]);
-        let m = SignedMessage::create(&id, "t", vec![1], 1, 9000);
-        assert!(validate(&m, &mut g, 9000).is_ok());
+        let m = signed(&id, "t", vec![1], 1, 9000);
+        assert!(tv(&m, &mut g, 9000).is_ok());
         assert_eq!((g.tracked_senders(), g.tracked_ids()), (1, 1));
     }
 
@@ -692,7 +1020,10 @@ mod tests {
     fn decode_rejects_garbage() {
         assert!(SignedMessage::decode(&[]).is_err());
         assert!(SignedMessage::decode(&[0xff; 4]).is_err());
-        assert!(SignedMessage::decode(&[1, 0, 0]).is_err()); // version ok, truncated
+        assert_eq!(
+            SignedMessage::decode(&[MSG_VERSION, 0, 0]),
+            Err(MsgError::Malformed)
+        ); // version ok, truncated
     }
     /// Regression (two review rounds): (1) a fresh-identity flood used to LRU-evict a victim's replay
     /// window and replay its message; (2) a global eviction floor let future-dated attacker messages
@@ -704,25 +1035,19 @@ mod tests {
         let mut g = ReplayGuard::with_limits(60_000, 4, 4);
         let at = |seed: u8, seqno: u64, ts: u64| msg(seed, seqno, ts, b"x").0;
         let victim = at(1, 1, 1000);
-        assert!(validate(&victim, &mut g, 1000).is_ok());
+        assert!(tv(&victim, &mut g, 1000).is_ok());
         // Sybil flood, FUTURE-dated by almost the whole skew window, evicts the victim's window.
         for k in 10..20u8 {
-            assert!(validate(&at(k, 1, 1000 + 29_000), &mut g, 1001 + k as u64).is_ok());
+            assert!(tv(&at(k, 1, 1000 + 29_000), &mut g, 1001 + k as u64).is_ok());
         }
         assert!(!g.tracks(&victim.sender), "premise: victim window evicted");
         // The victim's message still can't be replayed…
-        assert_eq!(
-            validate(&victim, &mut g, 1100).map(|_| ()),
-            Err(MsgError::Replay)
-        );
+        assert_eq!(tv(&victim, &mut g, 1100).map(|_| ()), Err(MsgError::Replay));
         // …its old message stays refused even after it is tracked again with a fresh message…
-        assert!(validate(&at(1, 2, 1200), &mut g, 1200).is_ok());
-        assert_eq!(
-            validate(&victim, &mut g, 1201).map(|_| ()),
-            Err(MsgError::Replay)
-        );
+        assert!(tv(&at(1, 2, 1200), &mut g, 1200).is_ok());
+        assert_eq!(tv(&victim, &mut g, 1201).map(|_| ()), Err(MsgError::Replay));
         // …and an honest newcomer at the current time is NOT locked out by the future-dated flood.
-        assert!(validate(&at(50, 1, 1300), &mut g, 1300).is_ok());
+        assert!(tv(&at(50, 1, 1300), &mut g, 1300).is_ok());
         assert!(!MsgError::Replay.is_invalid(), "never penalized");
     }
 
@@ -735,28 +1060,22 @@ mod tests {
         g.evicted = BoundedMap::new(2); // tiny exact floor table to force folding
         let at = |seed: u8, seqno: u64, ts: u64| msg(seed, seqno, ts, b"x").0;
         let victim = at(1, 1, 1000);
-        assert!(validate(&victim, &mut g, 1000).is_ok());
+        assert!(tv(&victim, &mut g, 1000).is_ok());
         for k in 10..60u8 {
             let ts = 1000 + k as u64;
-            assert!(validate(&at(k, 1, ts), &mut g, ts).is_ok());
+            assert!(tv(&at(k, 1, ts), &mut g, ts).is_ok());
         }
         assert!(!g.tracks(&victim.sender) && !g.evicted.contains_key(&victim.sender));
-        assert_eq!(
-            validate(&victim, &mut g, 2000).map(|_| ()),
-            Err(MsgError::Replay)
-        );
+        assert_eq!(tv(&victim, &mut g, 2000).map(|_| ()), Err(MsgError::Replay));
     }
 
     #[test]
     fn far_future_timestamps_are_refused() {
         let mut g = ReplayGuard::default();
         let (m, _) = msg(3, 1, 1000 + MAX_FUTURE_MS + 1, b"x");
-        assert_eq!(
-            validate(&m, &mut g, 1000).map(|_| ()),
-            Err(MsgError::Timestamp)
-        );
+        assert_eq!(tv(&m, &mut g, 1000).map(|_| ()), Err(MsgError::Timestamp));
         let (ok, _) = msg(4, 1, 1000 + MAX_FUTURE_MS, b"x");
-        assert!(validate(&ok, &mut g, 1000).is_ok());
+        assert!(tv(&ok, &mut g, 1000).is_ok());
     }
     /// Review round 5: the fallback bucket of a sender must not be predictable from its public id
     /// (or an attacker could grind identities into a chosen victim's bucket). Two guards (= two

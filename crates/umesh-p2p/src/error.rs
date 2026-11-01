@@ -28,6 +28,10 @@ pub enum P2pError {
     #[error("message: {0}")]
     Message(#[from] crate::gossip::MsgError),
 
+    /// Sealing / opening a sealed payload or blob failed (never carries key material).
+    #[error("sealed: {0}")]
+    Sealed(#[from] crate::sealed::SealError),
+
     /// I/O error.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),

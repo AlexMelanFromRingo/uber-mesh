@@ -10,6 +10,77 @@ All notable changes to **uber-mesh** are documented here. The format is loosely 
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-11-01 — E2E confidentiality, X-Wing, identity PoW, exact Chrome fingerprint (**wire-breaking**)
+
+> **Flag day:** X-Wing changes the obfs key derivation, gossip messages gain identity PoW (format v2) and
+> sealed messages (v3). Upgrade every node of a cohort together. Prompted by the 0.9.0 residual-gap list and
+> an external architecture review; see the new [`docs/threat-model.md`](docs/threat-model.md).
+
+### Security — X-Wing hybrid KEM (standard construction)
+- The "X-Wing-style" BLAKE3 combiner is replaced by **X-Wing** exactly as in
+  `draft-connolly-cfrg-xwing-kem-11` (SHA3-256 combiner, SHAKE256 seed keygen); all three official vectors
+  pass byte-for-byte (`tests/xwing_kat.rs`). The TLS `0x11EC` key-share layout is unchanged.
+
+### Security — TLS mimicry
+- **Exact Chrome 133+ ClientHello**: JA4 `t13d1516h2_8daaf6152771_d8a2da3f94cd` asserted for every hello
+  (`tests/fingerprint.rs`, JA4/JA3 oracles on the standard SHA-256/MD5 crates).
+- **Cover-site flight mimicry (REALITY-style)**: a listener with `--fallback` learns its cover site's real
+  ServerHello shape and encrypted-record layout (refreshed every ~30 min) and reproduces it for
+  authenticated clients; the client finds the confirmation in any bounded layout. New `mesh --cover-domain`
+  (`UMESH_COVER_DOMAIN`) sets the cohort's SNI / mimicked domain. Wire v2.1.
+- A TLS-terminating MITM now provably learns nothing (fails closed, its own hello is proxied to the cover).
+
+### Supply chain
+- hickory-proto, quinn, rcgen, time and the other never-built libp2p optional crates are gone from
+  `Cargo.lock` (libp2p's umbrella `tokio` feature replaced by direct `libp2p-swarm`/`libp2p-tcp` features,
+  swarm assembled by hand); `cargo audit` is clean without the hickory ignores.
+
+### Docs
+- `docs/threat-model.md`: trust boundaries, what each party sees, real-TLS-vs-imitation byte map,
+  PQ coverage table, evidence levels (implemented / model / external / real network), requirement → test
+  traceability. `spec.md` status synced.
+
+### Security — end-to-end payload confidentiality: sealed topics + encrypted blobs (gossip format v3)
+- Closes the spec gap "a relay or content-serving peer MUST be unable to read payloads it forwards": gossip
+  payloads were only signed (every forwarder read them) and blobs were stored/served in cleartext.
+- **Sealed topics.** A topic with a 32-byte topic key publishes format **v3**: payload =
+  `nonce(24) ‖ XChaCha20-Poly1305` under `derive_key("uber-mesh v1 topic epoch key",
+  derive_key("uber-mesh v1 topic key", topic_key ‖ topic) ‖ day)`, AAD binds (version, topic, sender, seqno,
+  timestamp). Signature/`payload_hash` cover the ciphertext, so key-less peers validate (PoW, signature,
+  replay) and forward but never deliver; members decrypt after validation; members refuse public messages on
+  a sealed topic. Signed under `uber-mesh-msg-v3` (version flips break the signature). Topics without a key
+  stay public (v2, byte-for-byte unchanged). Static key: no forward secrecy (documented, ratchet deferred).
+- **Encrypted blobs.** `MeshNode::seal_blob` encrypts under a fresh content key and stores the ciphertext
+  (`Cid` over the ciphertext); `announce_blob` sends `(cid, content_key)` inside a sealed message
+  (`MeshEvent::SealedBlob`); `request_sealed_blob` verifies, decrypts and keeps only ciphertext.
+- **Keys/CLI.** `mesh --topic-key-file <PATH>`, `UMESH_TOPIC_KEY`, or `config.toml [topic_keys]` (a config
+  holding topic keys must be `0600`, else refused); `keys new-topic-key --out <PATH>` (new `0600` file, key
+  never printed). Keys are zeroized, never logged; `status` lists sealed topic names only.
+- API: `umesh_p2p::sealed::{TopicKey, SealedTopic, ContentKey, SealedBlobRef, SealedPayload, seal_message,
+  open_message, seal_blob, open_blob}`; `MeshNode::{set_topic_key, clear_topic_key, is_sealed, seal_blob,
+  announce_blob, request_sealed_blob, stored, is_connected}`; `MeshEvent::Message` gains `sealed: bool`;
+  new `MeshEvent::SealedBlob`; `SignedMessage.sealed`, `SEALED_MSG_VERSION`, `create_sealed_with_pow`;
+  metrics `umesh_gossip_sealed_{unread,refused}_total`. Fuzz target `sealed_parse`.
+
+### Security — identity proof-of-work for gossip senders (**wire-breaking**: gossip format v2)
+- Closes the residual fresh-identity-flood DoS on the replay-floor table (deferred in 0.9.0): every
+  gossip message now carries the sender's `pow_nonce`, and
+  `BLAKE3-derive_key("uber-mesh v1 identity pow", sender_key ‖ nonce)` must have ≥ 24 leading zero bits
+  (`MIN_SENDER_POW_BITS`, one network-wide constant in `umesh-crypto::pow`). The nonce is signed and
+  bound to the key; insufficient work is `Reject`ed (forwarder penalized) before the signature check and
+  before any replay state is touched. v1 messages are `Ignore`d, never penalized.
+- Honest cost: one-time ≈2^24 hashes — ≈1.7 s on one core / ≈0.25 s on 12 threads (Ryzen 5 5500).
+  A 10-minute flood of ≈135 new identities/s now needs ≈2.3·10⁹ hashes/s (≈225 cores) live, or ≈38
+  core-hours of pre-mined identities — friction, not a barrier (see `docs/security-and-deferred.md`).
+- `uber-mesh init` mines the nonce (with progress) and stores it in `identity.pow` next to the key
+  (`0600`, atomic, re-verified on load). Keystores from earlier releases are migrated automatically: the
+  nonce is mined once on the first `mesh` start; `identity.key` is never rewritten. `keys show` reports the
+  PoW bits (`--json`: `pow_nonce`, `pow_bits`, `pow_min_bits`).
+- API: `MeshNode::new(seed, pow_nonce, psk)` / `with_transport(seed, pow_nonce, …)` (refuse an identity
+  below the minimum); `SignedMessage::create_with_pow`; `MsgError::InsufficientPow`;
+  `umesh_crypto::pow::{identity_digest, verify_identity, mine_identity}`; `keystore::{load_with_pow,
+  load_pow, save_pow, mine_pow}`.
+
 ## [0.9.0] — 2026-11-01 — security audit (**wire-breaking**)
 
 Full security audit with proof-of-concept tests; every finding below has a regression test.

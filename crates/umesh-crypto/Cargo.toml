@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "Pure-Rust crypto core for uber-mesh: hybrid X25519+ML-KEM-768, Ed25519, BLAKE3, XChaCha20-Poly1305, Merkle, PoW"
+description = "Pure-Rust crypto core for uber-mesh: X-Wing hybrid KEM (X25519+ML-KEM-768), Ed25519, BLAKE3, XChaCha20-Poly1305, Merkle, PoW"
 
 [dependencies]
 blake3.workspace = true
@@ -13,7 +13,12 @@ ed25519-dalek.workspace = true
 x25519-dalek.workspace = true
 # `zeroize`: wipe ML-KEM decapsulation keys and the cached XChaCha20-Poly1305 key on drop
 # (constitution Principle I). Features are additive on top of the workspace pins.
-ml-kem = { workspace = true, features = ["zeroize"] }
+# `hazmat`: `encapsulate_deterministic` for X-Wing `EncapsulateDerand` (fed 32 fresh OsRng bytes in
+# production; fixed `eseed` only in the KATs).
+ml-kem = { workspace = true, features = ["zeroize", "hazmat"] }
+# `zeroize`: wipe the SHA3/SHAKE sponge state (which absorbs secrets) on drop.
+sha3 = { workspace = true, features = ["zeroize"] }
+shake = { workspace = true, features = ["zeroize"] }
 chacha20poly1305 = { workspace = true, features = ["zeroize"] }
 rand.workspace = true
 zeroize.workspace = true

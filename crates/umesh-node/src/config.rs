@@ -1,7 +1,7 @@
 //! Node configuration (`config.toml`) and data-directory layout.
 
+use std::collections::BTreeMap;
 use std::fmt;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -12,8 +12,9 @@ use crate::error::{NodeError, Result};
 
 /// On-disk node configuration.
 ///
-/// `config.toml` carries the cohort PSK, so it is written owner-only (`0600`) and the PSK is wiped
-/// from memory when the config is dropped. `Debug` redacts the PSK.
+/// `config.toml` carries the cohort PSK and any sealed-topic keys, so it is written owner-only
+/// (`0600`) and those secrets are wiped from memory when the config is dropped. `Debug` redacts
+/// them (topic names are shown, keys never).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Environment profile name: `open` | `moderate` | `aggressive` | `shutdown`.
@@ -29,6 +30,12 @@ pub struct Config {
     /// This gates the obfs handshake (probe resistance). It is NOT a node secret — it is shared
     /// out-of-band among peers that should be able to reach each other, like a bridge line.
     pub psk_hex: String,
+    /// Sealed-topic keys: topic name → hex-encoded 32-byte topic key, shared out of band among the
+    /// topic's members (end-to-end payload confidentiality; see `umesh_p2p::sealed`). A topic not
+    /// listed here is **public**: every peer that forwards its messages can read them. A config
+    /// holding topic keys must not be group/world-accessible (refused on load).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub topic_keys: BTreeMap<String, String>,
 }
 
 impl fmt::Debug for Config {
@@ -38,6 +45,14 @@ impl fmt::Debug for Config {
             .field("listen", &self.listen)
             .field("bootstrap", &self.bootstrap)
             .field("psk_hex", &"<redacted>")
+            .field(
+                "topic_keys",
+                &self
+                    .topic_keys
+                    .keys()
+                    .map(|t| (t.as_str(), "<redacted>"))
+                    .collect::<BTreeMap<_, _>>(),
+            )
             .finish()
     }
 }
@@ -45,6 +60,9 @@ impl fmt::Debug for Config {
 impl Drop for Config {
     fn drop(&mut self) {
         self.psk_hex.zeroize();
+        for v in self.topic_keys.values_mut() {
+            v.zeroize();
+        }
     }
 }
 
@@ -56,6 +74,7 @@ impl Config {
             listen: Some("127.0.0.1:4001".to_string()),
             bootstrap: Vec::new(),
             psk_hex,
+            topic_keys: BTreeMap::new(),
         }
     }
 
@@ -65,7 +84,24 @@ impl Config {
         let s = zeroize::Zeroizing::new(std::fs::read_to_string(path)?);
         let cfg: Config = toml::from_str(&s).map_err(|e| NodeError::Config(e.to_string()))?;
         cfg.profile()?;
+        if !cfg.topic_keys.is_empty() {
+            refuse_shared_permissions(path)?;
+            for topic in cfg.topic_keys.keys() {
+                cfg.topic_key(topic)?;
+            }
+        }
         Ok(cfg)
+    }
+
+    /// Decode the sealed-topic key configured for `topic`, if any (wiped on drop). The error names
+    /// the topic, never the value.
+    pub fn topic_key(&self, topic: &str) -> Result<Option<zeroize::Zeroizing<[u8; 32]>>> {
+        let Some(h) = self.topic_keys.get(topic) else {
+            return Ok(None);
+        };
+        decode_key32(h).map(Some).ok_or_else(|| {
+            NodeError::Config(format!("topic_keys[{topic:?}] must be 32 bytes of hex"))
+        })
     }
 
     /// Persist config to a TOML file with owner-only (`0600`) permissions.
@@ -77,23 +113,7 @@ impl Config {
         let s = zeroize::Zeroizing::new(
             toml::to_string_pretty(self).map_err(|e| NodeError::Config(e.to_string()))?,
         );
-        let file_name = path
-            .file_name()
-            .ok_or_else(|| NodeError::Config(format!("invalid config path {}", path.display())))?;
-        let mut tmp_name = file_name.to_os_string();
-        tmp_name.push(format!(".tmp.{}", std::process::id()));
-        let tmp = path.with_file_name(tmp_name);
-        let res = (|| -> Result<()> {
-            let mut f = crate::keystore::create_owner_only(&tmp)?;
-            f.write_all(s.as_bytes())?;
-            f.sync_all()?;
-            std::fs::rename(&tmp, path)?;
-            Ok(())
-        })();
-        if res.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        res
+        crate::keystore::write_owner_only_atomic(path, s.as_bytes())
     }
 
     /// Resolve the environment profile. An unknown name is a configuration error.
@@ -104,6 +124,11 @@ impl Config {
                 self.profile
             ))
         })
+    }
+
+    /// Names of the topics this config holds keys for (never the keys).
+    pub fn sealed_topics(&self) -> Vec<String> {
+        self.topic_keys.keys().cloned().collect()
     }
 
     /// Decode the obfs PSK bytes from their hex representation (wiped on drop).
@@ -137,6 +162,37 @@ impl Config {
     }
 }
 
+/// Decode exactly 32 bytes of hex (surrounding whitespace ignored) into a wiped buffer.
+pub fn decode_key32(h: &str) -> Option<zeroize::Zeroizing<[u8; 32]>> {
+    let v = zeroize::Zeroizing::new(hex::decode(h.trim()).ok()?);
+    if v.len() != 32 {
+        return None;
+    }
+    let mut arr = zeroize::Zeroizing::new([0u8; 32]);
+    arr.copy_from_slice(&v);
+    Some(arr)
+}
+
+/// Refuse a secrets-bearing file that group/others can access (Unix). `save` always writes `0600`;
+/// this catches a config edited or copied in by hand.
+fn refuse_shared_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Err(NodeError::Config(format!(
+                "{} holds topic keys but is accessible by group/others (mode {:o}); run `chmod 600`",
+                path.display(),
+                mode & 0o777
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 /// Standard paths inside a data directory.
 pub struct DataDir {
     /// Root data directory.
@@ -152,6 +208,11 @@ impl DataDir {
     /// Path to the identity keystore file.
     pub fn identity(&self) -> PathBuf {
         self.root.join("identity.key")
+    }
+
+    /// Path to the identity proof-of-work sidecar (public nonce; see [`crate::keystore`]).
+    pub fn identity_pow(&self) -> PathBuf {
+        crate::keystore::pow_path(&self.identity())
     }
 
     /// Path to the config file.
@@ -270,6 +331,63 @@ mod tests {
                 .is_symlink()
         );
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn topic_keys_roundtrip_are_redacted_and_validated() {
+        let dir = tmpdir("cfg-topic");
+        let path = dir.join("config.toml");
+        let key_hex = "5e".repeat(32);
+        let mut cfg = Config::default_with_psk("aa".repeat(32));
+        assert!(
+            !toml::to_string(&cfg).unwrap().contains("topic_keys"),
+            "omitted when empty"
+        );
+        cfg.topic_keys
+            .insert("uber-mesh/secret".into(), key_hex.clone());
+        assert!(
+            !format!("{cfg:?}").contains(&key_hex),
+            "Debug redacts topic keys"
+        );
+        assert!(format!("{cfg:?}").contains("uber-mesh/secret"));
+        cfg.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(
+            *loaded.topic_key("uber-mesh/secret").unwrap().unwrap(),
+            [0x5e; 32]
+        );
+        assert!(loaded.topic_key("uber-mesh/global").unwrap().is_none());
+        assert_eq!(loaded.sealed_topics(), vec!["uber-mesh/secret".to_string()]);
+
+        // A malformed key is a config error that never echoes the value.
+        cfg.topic_keys.insert("t".into(), "ab".repeat(31));
+        cfg.save(&path).unwrap();
+        let err = Config::load(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("topic_keys") && !err.contains(&"ab".repeat(31)),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn world_readable_config_with_topic_keys_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmpdir("cfg-topic-perm");
+        let path = dir.join("config.toml");
+        let mut cfg = Config::default_with_psk("aa".repeat(32));
+        cfg.topic_keys.insert("t".into(), "11".repeat(32));
+        cfg.save(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = Config::load(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("chmod 600") && !err.contains(&"11".repeat(32)),
+            "{err}"
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(Config::load(&path).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

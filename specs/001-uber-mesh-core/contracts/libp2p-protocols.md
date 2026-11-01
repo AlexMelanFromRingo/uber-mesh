@@ -10,7 +10,7 @@
 | Rendezvous | `/uber-mesh/rendezvous/1.0.0` | namespace bootstrap |
 | Ping | `/ipfs/ping/1.0.0` | standard |
 | Relay v2 / DCUtR / AutoNAT v2 | libp2p defaults | standard hop/stop/dcutr/autonat (client **and** server) |
-| Blob exchange | `/uber-mesh/blobs/1.0.0` | request-response, bincode (see below) |
+| Blob exchange | `/uber-mesh/blobs/1.0.0` | request-response, bincode (see below); sealed-topic blobs are ciphertext |
 | Set reconciliation | `/uber-mesh/reconcile/1.0.0` | request-response, bincode (see below) |
 
 ## NetworkBehaviour composition (umesh-p2p)
@@ -60,7 +60,12 @@ Frame = `u32_le length ‖ bincode(standard, varint) body`. Decoding uses a binc
 container length claim is checked before allocation) and rejects trailing bytes.
 
 - Blobs: request = 32-byte cid (frame ≤ 64 B); response = `Option<Vec<u8>>`, data ≤ 8 MiB (frame ≤ 8 MiB+16).
-  The receiver verifies `BLAKE3(data) == cid`. Serving is rate-limited per peer (token bucket: 64 MiB burst,
+  The receiver verifies `BLAKE3(data) == cid`. The protocol is content-agnostic: a blob shared in a
+  **sealed topic** is stored, reconciled and served as **ciphertext** (`nonce ‖ XChaCha20-Poly1305 ‖ tag`
+  under a per-blob content key), and its `cid` is over the ciphertext — so a serving or mirroring peer
+  verifies and serves it without being able to read it; only members, who receive `(cid, content_key)`
+  inside a sealed gossip message, decrypt it (message-wire.md "Encrypted blobs"). Public blobs carry
+  plaintext, as before. Serving is rate-limited per peer (token bucket: 64 MiB burst,
   8 MiB/s, ≥ 4 KiB charged per request); over-budget requests get no response.
 - Reconcile: frame ≤ 2 MiB. A message is a list of `Segment { upper: Option<[u8;32]>, mode }` that MUST
   satisfy: 1 ≤ segments ≤ 8192; `upper`s strictly increasing with the first `> [0;32]` (non-empty ranges
@@ -97,3 +102,11 @@ accept-PX 10, opportunistic-graft 20. Message-id: see message-wire.md.
 
 Gossipsub uses the private prefix `/uber-mesh/meshsub` (set via `protocol_id_prefix`), so it never
 interoperates with stock libp2p gossipsub meshes.
+
+## Confidentiality per hop vs. end to end
+
+Every link is encrypted (obfs hybrid-PQ AEAD around Noise), but each hop terminates it: a gossip forwarder
+and a blob-serving peer see what they relay. Payload confidentiality against them comes only from
+**sealed topics** (message-wire.md "Sealed messages (v3)"). A Circuit Relay v2 relay is different: it splices
+two streams and the relayed connection runs its own Noise handshake end to end, so the relay sees only Noise
+ciphertext (plus both endpoints' PeerIds, timing and volume).

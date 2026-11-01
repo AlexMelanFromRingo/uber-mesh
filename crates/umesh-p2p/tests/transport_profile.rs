@@ -7,7 +7,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use umesh_obfs::{ObfsPsk, ProbeResponse, ShapingPolicy};
-use umesh_p2p::{MeshEvent, MeshNode};
+use umesh_p2p::MeshEvent;
+
+mod common;
 
 fn tcp_port(addr: &libp2p::Multiaddr) -> u16 {
     addr.iter()
@@ -34,7 +36,7 @@ async fn prober_is_spliced_to_configured_cover_site() {
         }
     });
 
-    let mut node = MeshNode::with_transport(
+    let mut node = common::node_with_transport(
         &[21u8; 32],
         ObfsPsk::new([1u8; 32]),
         ShapingPolicy::none(),
@@ -82,14 +84,14 @@ async fn prober_is_spliced_to_configured_cover_site() {
 #[tokio::test]
 async fn shaped_and_unshaped_nodes_gossip() {
     let psk = ObfsPsk::new([2u8; 32]);
-    let mut a = MeshNode::with_transport(
+    let mut a = common::node_with_transport(
         &[22u8; 32],
         psk.clone(),
         ShapingPolicy::aggressive(),
         ProbeResponse::Silence,
     )
     .unwrap();
-    let mut b = MeshNode::new(&[23u8; 32], psk).unwrap();
+    let mut b = common::node(&[23u8; 32], psk).unwrap();
     let topic = "uber-mesh/shaped";
     a.subscribe(topic).unwrap();
     b.subscribe(topic).unwrap();

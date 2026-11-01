@@ -313,6 +313,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
+ "zeroize",
 ]
 
 [[package]]
@@ -727,7 +728,9 @@ version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
 dependencies = [
+ "block-buffer 0.12.1",
  "crypto-common 0.2.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -1789,6 +1792,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest 0.10.7",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2676,6 +2689,9 @@ name = "sponge-cursor"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a0219bd7d979d58245a4f41f695e1ac9f8befdffadd7f61f1bae9e39abc6620"
+dependencies = [
+ "zeroize",
+]
 
 [[package]]
 name = "stable_deref_trait"
@@ -3053,6 +3069,8 @@ dependencies = [
  "ml-kem",
  "proptest",
  "rand 0.8.8",
+ "sha3",
+ "shake",
  "subtle",
  "thiserror 2.0.21",
  "x25519-dalek",
@@ -3081,7 +3099,9 @@ name = "umesh-obfs"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "md-5",
  "rand 0.8.8",
+ "sha2",
  "subtle",
  "thiserror 2.0.21",
  "tokio",
@@ -3101,12 +3121,14 @@ dependencies = [
  "libp2p-swarm",
  "libp2p-tcp",
  "rand 0.8.8",
+ "subtle",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
  "tracing",
  "umesh-crypto",
  "umesh-obfs",
+ "zeroize",
 ]
 
 [[package]]

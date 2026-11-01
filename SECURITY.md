@@ -50,7 +50,7 @@ uber-mesh is **pre-1.0** and moves fast; the API and wire formats are not yet st
 
 | Version | Supported |
 |---|---|
-| Latest tagged release (currently **v0.9.0**) | ✅ Security fixes land here |
+| Latest tagged release (currently **v0.10.0**) | ✅ Security fixes land here |
 | Any older tag | ❌ Not supported — upgrade to the latest tag |
 | `main` between tags | ⚠️ Best-effort only |
 
@@ -83,7 +83,7 @@ classifiers at scale (we model these in tests but cannot claim to defeat the rea
 What the implementation provides today, with the crate that owns each property:
 
 - **Hybrid post-quantum confidentiality, classical-authoritative.** Every link derives ephemeral
-  session keys from a hybrid **X25519 + ML-KEM-768** KEM combined with an X-Wing-style BLAKE3 combiner
+  session keys from a hybrid **X25519 + ML-KEM-768** KEM combined as **X-Wing** (draft-connolly-cfrg-xwing-kem-11; official vectors in `tests/xwing_kat.rs`)
   (`umesh-crypto::kem`). All mesh traffic rides inside the obfs AEAD record stream, so libp2p's own
   Noise layer sits *inside* a PQ-keyed tunnel — defeating HNDL for mesh data. A break of ML-KEM-768
   alone cannot compromise a session because the classical X25519 half remains authoritative.

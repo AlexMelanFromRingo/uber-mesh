@@ -5,13 +5,15 @@ use std::time::Duration;
 
 use umesh_crypto::hash::Cid;
 use umesh_obfs::ObfsPsk;
-use umesh_p2p::{MeshEvent, MeshNode};
+use umesh_p2p::MeshEvent;
+
+mod common;
 
 #[tokio::test]
 async fn requests_and_verifies_a_blob() {
     let psk = ObfsPsk::new([8u8; 32]);
-    let mut a = MeshNode::new(&[1u8; 32], psk.clone()).unwrap();
-    let mut b = MeshNode::new(&[2u8; 32], psk).unwrap();
+    let mut a = common::node(&[1u8; 32], psk.clone()).unwrap();
+    let mut b = common::node(&[2u8; 32], psk).unwrap();
     let a_peer = a.local_peer_id();
 
     // A holds some content; B will ask for it by Cid.
@@ -55,8 +57,8 @@ async fn requests_and_verifies_a_blob() {
 #[tokio::test]
 async fn unknown_blob_is_unavailable() {
     let psk = ObfsPsk::new([9u8; 32]);
-    let mut a = MeshNode::new(&[3u8; 32], psk.clone()).unwrap();
-    let mut b = MeshNode::new(&[4u8; 32], psk).unwrap();
+    let mut a = common::node(&[3u8; 32], psk.clone()).unwrap();
+    let mut b = common::node(&[4u8; 32], psk).unwrap();
     let a_peer = a.local_peer_id();
     let missing = Cid::of(b"content that nobody has");
 

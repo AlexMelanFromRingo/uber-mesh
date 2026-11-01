@@ -18,6 +18,11 @@ pub static GOSSIP_PUBLISHED: AtomicU64 = AtomicU64::new(0);
 pub static GOSSIP_REJECTED: AtomicU64 = AtomicU64::new(0);
 /// Gossip messages ignored (replay/duplicate/stale — not penalized) (counter).
 pub static GOSSIP_IGNORED: AtomicU64 = AtomicU64::new(0);
+/// Valid sealed messages forwarded but not delivered: this node holds no key for the topic.
+pub static GOSSIP_SEALED_UNREAD: AtomicU64 = AtomicU64::new(0);
+/// Valid messages on a topic we hold a key for that were not delivered: wrong key / failed AEAD,
+/// malformed inner payload, or a public (unsealed) message on a sealed topic (downgrade refused).
+pub static GOSSIP_SEALED_REFUSED: AtomicU64 = AtomicU64::new(0);
 /// Inbound blob/reconcile requests dropped by the per-peer rate limiter (counter).
 pub static REQUESTS_RATE_LIMITED: AtomicU64 = AtomicU64::new(0);
 /// Blobs served to peers (counter).
@@ -110,6 +115,20 @@ pub fn render() -> String {
         "Gossip messages ignored (replay, duplicate or stale)",
         "counter",
         GOSSIP_IGNORED.load(Relaxed) as i64,
+    );
+    g(
+        &mut s,
+        "umesh_gossip_sealed_unread_total",
+        "Sealed messages forwarded without a topic key (not delivered)",
+        "counter",
+        GOSSIP_SEALED_UNREAD.load(Relaxed) as i64,
+    );
+    g(
+        &mut s,
+        "umesh_gossip_sealed_refused_total",
+        "Messages on a sealed topic not delivered (failed AEAD, malformed, or unsealed)",
+        "counter",
+        GOSSIP_SEALED_REFUSED.load(Relaxed) as i64,
     );
     g(
         &mut s,

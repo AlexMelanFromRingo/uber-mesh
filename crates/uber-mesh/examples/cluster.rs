@@ -131,7 +131,12 @@ async fn main() {
     for i in 0..n {
         let mut seed = [0u8; 32];
         seed[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
-        let mut node = MeshNode::new(&seed, psk.clone()).unwrap();
+        // Real network-minimum identity PoW (~0.25 s per node on all cores in release).
+        let key = umesh_crypto::identity::NodeIdentity::from_seed(&seed)
+            .verifying_key()
+            .to_bytes();
+        let nonce = umesh_crypto::pow::mine_identity(&key, umesh_p2p::MIN_SENDER_POW_BITS).unwrap();
+        let mut node = MeshNode::new(&seed, nonce, psk.clone()).unwrap();
         node.listen("/ip4/127.0.0.1/tcp/0").unwrap();
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(64);
         cmd_txs.push(cmd_tx);

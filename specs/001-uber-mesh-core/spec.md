@@ -4,7 +4,8 @@
 
 **Created**: 2026-06-28
 
-**Status**: Draft
+**Status**: Implemented through v0.10.0 (QUIC/AmneziaWG/local-RF transports deferred). Requirement → test
+traceability and evidence levels: [`docs/threat-model.md`](../../docs/threat-model.md).
 
 **Input**: User description: "Decentralized, censorship-resistant P2P mesh network built on modern,
 standardized, audited cryptography. Must establish stable connectivity even under harsh DPI/TSPU
