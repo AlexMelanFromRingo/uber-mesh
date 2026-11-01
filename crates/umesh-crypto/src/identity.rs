@@ -79,7 +79,7 @@ impl NodeIdentity {
 
     /// Export the 32-byte secret seed (for persistence to a 0600 keystore only).
     ///
-    /// The caller is responsible for zeroizing the returned buffer after writing it.
+    /// The caller MUST wipe the returned copy, e.g. `Zeroizing::new(id.to_seed_bytes())`.
     pub fn to_seed_bytes(&self) -> [u8; 32] {
         self.signing.to_bytes()
     }
@@ -166,6 +166,21 @@ mod tests {
         let b = NodeIdentity::from_seed(&seed);
         assert_eq!(a.peer_id(), b.peer_id());
         assert_eq!(a.to_seed_bytes(), seed);
+    }
+
+    #[test]
+    fn debug_never_leaks_secret_seed() {
+        let id = NodeIdentity::from_seed(&[0x5Au8; 32]);
+        let dbg = format!("{id:?}");
+        assert!(dbg.starts_with("NodeIdentity(b3:"));
+        assert!(!dbg.contains(&"5a".repeat(32)));
+    }
+
+    /// Principle I: the long-term signing key wipes itself on drop (ed25519-dalek `zeroize`).
+    #[test]
+    fn signing_key_is_zeroize_on_drop() {
+        fn zod<T: zeroize::ZeroizeOnDrop>() {}
+        zod::<SigningKey>();
     }
 
     #[test]

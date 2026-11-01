@@ -3,11 +3,13 @@
 //! Random 24-byte nonces remove cross-peer nonce-coordination footguns (research D5). The wire
 //! format is `nonce(24) || ciphertext||tag`; AAD is authenticated but not transmitted.
 
+use core::fmt;
+
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rand::RngCore;
 use rand::rngs::OsRng;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::{CryptoError, Result};
 use crate::hash::{self, Hash32};
@@ -17,29 +19,42 @@ pub const NONCE_LEN: usize = 24;
 /// Poly1305 tag length.
 pub const TAG_LEN: usize = 16;
 
-/// A 256-bit AEAD key. Zeroized on drop.
-pub struct AeadKey(Hash32);
+/// A 256-bit AEAD key.
+///
+/// The key is held only inside one cached, keyed [`XChaCha20Poly1305`] instance (built once, not
+/// per record), which zeroizes its key on drop (`chacha20poly1305/zeroize`). No other copy of the
+/// key is retained. `Debug` is redacted.
+pub struct AeadKey {
+    cipher: XChaCha20Poly1305,
+}
 
-impl Drop for AeadKey {
-    fn drop(&mut self) {
-        self.0.zeroize();
+// Sound: the only field is `XChaCha20Poly1305`, which is itself `ZeroizeOnDrop`.
+impl ZeroizeOnDrop for AeadKey {}
+
+impl fmt::Debug for AeadKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AeadKey(<redacted>)")
     }
 }
 
 impl AeadKey {
-    /// Wrap raw 32 key bytes.
-    pub fn from_bytes(key: Hash32) -> Self {
-        AeadKey(key)
+    /// Wrap raw 32 key bytes. The caller remains responsible for wiping its own copy of `key`.
+    pub fn from_bytes(mut key: Hash32) -> Self {
+        // `new_from_slice` keys the cipher straight from `key` (no temporary Array copy).
+        let cipher = XChaCha20Poly1305::new_from_slice(&key).expect("32-byte key is always valid");
+        key.zeroize();
+        AeadKey { cipher }
     }
 
     /// Derive a key from input keying material under a domain-separation `context`
-    /// (use a label from [`hash::labels`]).
-    pub fn derive(context: &str, ikm: &[u8]) -> Self {
-        AeadKey(hash::derive_key(context, ikm))
+    /// (use a label from [`hash::labels`]). `ikm` may be any byte container, including a
+    /// [`crate::kem::SharedSecret`].
+    pub fn derive<K: AsRef<[u8]> + ?Sized>(context: &str, ikm: &K) -> Self {
+        Self::from_bytes(hash::derive_key(context, ikm.as_ref()))
     }
 
-    fn cipher(&self) -> XChaCha20Poly1305 {
-        XChaCha20Poly1305::new_from_slice(&self.0).expect("32-byte key is always valid")
+    fn cipher(&self) -> &XChaCha20Poly1305 {
+        &self.cipher
     }
 }
 
@@ -116,6 +131,33 @@ mod tests {
         let a = seal(&key, b"x", b"");
         let b = seal(&key, b"x", b"");
         assert_ne!(a[..NONCE_LEN], b[..NONCE_LEN], "nonces must differ");
+    }
+
+    /// Principle I: the cached cipher (and therefore `AeadKey`) wipes its key on drop. Fails to
+    /// compile without the `chacha20poly1305/zeroize` feature.
+    #[test]
+    fn key_types_are_zeroize_on_drop() {
+        fn zod<T: ZeroizeOnDrop>() {}
+        zod::<XChaCha20Poly1305>();
+        zod::<AeadKey>();
+    }
+
+    #[test]
+    fn debug_is_redacted() {
+        let key = AeadKey::from_bytes([0xA5; 32]);
+        let s = format!("{key:?}");
+        assert_eq!(s, "AeadKey(<redacted>)");
+    }
+
+    #[test]
+    fn derive_accepts_shared_secret_and_slices() {
+        let (i, m) = crate::kem::Initiator::start();
+        let (ss, r) = crate::kem::respond(&m).unwrap();
+        let ss_i = i.finish(&r).unwrap();
+        let a = AeadKey::derive(hash::labels::TRAFFIC_C2S, &ss);
+        let b = AeadKey::derive(hash::labels::TRAFFIC_C2S, ss_i.expose());
+        let wire = seal(&a, b"x", b"");
+        assert_eq!(open(&b, &wire, b"").unwrap(), b"x");
     }
 
     #[test]

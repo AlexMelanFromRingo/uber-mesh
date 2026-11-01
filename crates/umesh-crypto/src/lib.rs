@@ -8,7 +8,7 @@
 //! - [`identity`]: Ed25519 node identity, signing, `PeerId = BLAKE3(pubkey)`.
 //! - [`aead`]: XChaCha20-Poly1305 authenticated encryption.
 //! - [`kem`]: hybrid X25519 + ML-KEM-768 key agreement (X-Wing-style combiner).
-//! - [`merkle`]: BLAKE3 Merkle tree membership proofs.
+//! - [`merkle`]: domain-separated BLAKE3 Merkle tree (RFC 9162 construction) membership proofs.
 //! - [`pow`]: BLAKE3 proof-of-work identity-creation friction.
 #![forbid(unsafe_code)]
 
@@ -22,3 +22,4 @@ pub mod pow;
 
 pub use error::{CryptoError, Result};
 pub use hash::{Cid, Hash32};
+pub use kem::SharedSecret;

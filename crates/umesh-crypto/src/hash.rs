@@ -24,6 +24,14 @@ pub mod labels {
     pub const CID: &str = "uber-mesh v1 cid";
     /// Proof-of-work challenge domain.
     pub const POW: &str = "uber-mesh v1 pow";
+    /// Proof-of-work solution digest: `H(challenge ‖ nonce)` (distinct from challenge derivation).
+    pub const POW_SOLVE: &str = "uber-mesh v1 pow solve";
+    /// Merkle leaf hashing (RFC 9162 `0x00` prefix equivalent).
+    pub const MERKLE_LEAF: &str = "uber-mesh v1 merkle leaf";
+    /// Merkle internal-node hashing (RFC 9162 `0x01` prefix equivalent).
+    pub const MERKLE_NODE: &str = "uber-mesh v1 merkle node";
+    /// Merkle root commitment binding the tree size.
+    pub const MERKLE_ROOT: &str = "uber-mesh v1 merkle root";
 }
 
 /// Plain BLAKE3 hash of `bytes`.
@@ -104,6 +112,25 @@ mod tests {
         let a = derive_key(labels::TRAFFIC_C2S, ikm);
         let b = derive_key(labels::TRAFFIC_S2C, ikm);
         assert_ne!(a, b, "different contexts must yield different keys");
+    }
+
+    #[test]
+    fn all_labels_are_distinct() {
+        let all = [
+            labels::TRAFFIC_C2S,
+            labels::TRAFFIC_S2C,
+            labels::XWING,
+            labels::OBFS_MAC,
+            labels::OBFS_FRAME,
+            labels::CID,
+            labels::POW,
+            labels::POW_SOLVE,
+            labels::MERKLE_LEAF,
+            labels::MERKLE_NODE,
+            labels::MERKLE_ROOT,
+        ];
+        let set: std::collections::HashSet<_> = all.iter().collect();
+        assert_eq!(set.len(), all.len());
     }
 
     #[test]

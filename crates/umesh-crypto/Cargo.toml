@@ -11,9 +11,10 @@ description = "Pure-Rust crypto core for uber-mesh: hybrid X25519+ML-KEM-768, Ed
 blake3.workspace = true
 ed25519-dalek.workspace = true
 x25519-dalek.workspace = true
-ml-kem.workspace = true
-chacha20poly1305.workspace = true
-rs_merkle.workspace = true
+# `zeroize`: wipe ML-KEM decapsulation keys and the cached XChaCha20-Poly1305 key on drop
+# (constitution Principle I). Features are additive on top of the workspace pins.
+ml-kem = { workspace = true, features = ["zeroize"] }
+chacha20poly1305 = { workspace = true, features = ["zeroize"] }
 rand.workspace = true
 zeroize.workspace = true
 subtle.workspace = true

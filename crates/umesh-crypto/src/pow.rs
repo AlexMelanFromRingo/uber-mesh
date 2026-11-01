@@ -28,12 +28,20 @@ fn leading_zero_bits(h: &Hash32) -> u32 {
     bits
 }
 
-/// Test whether `nonce` solves `challenge` at the given `difficulty` (leading zero bits).
-pub fn meets(challenge: &Hash32, nonce: u64, difficulty: u32) -> bool {
+/// The PoW solution digest: `BLAKE3.derive_key(labels::POW_SOLVE, challenge ‖ u64_le(nonce))`.
+///
+/// Uses its own domain label (Principle I) so a PoW digest can never collide with a plain
+/// `hash()` used elsewhere (content hashing, message IDs, Merkle leaves, …).
+pub fn digest(challenge: &Hash32, nonce: u64) -> Hash32 {
     let mut buf = [0u8; 40];
     buf[..32].copy_from_slice(challenge);
     buf[32..].copy_from_slice(&nonce.to_le_bytes());
-    leading_zero_bits(&hash::hash(&buf)) >= difficulty
+    hash::derive_key(hash::labels::POW_SOLVE, &buf)
+}
+
+/// Test whether `nonce` solves `challenge` at the given `difficulty` (leading zero bits).
+pub fn meets(challenge: &Hash32, nonce: u64, difficulty: u32) -> bool {
+    leading_zero_bits(&digest(challenge, nonce)) >= difficulty
 }
 
 /// Brute-force a nonce solving `challenge` at `difficulty`. Keep `difficulty` small in tests.
@@ -75,6 +83,18 @@ mod tests {
     fn challenge_is_bound_to_key_and_epoch() {
         assert_ne!(challenge(&[1u8; 32], 0), challenge(&[2u8; 32], 0));
         assert_ne!(challenge(&[1u8; 32], 0), challenge(&[1u8; 32], 1));
+    }
+
+    #[test]
+    fn solution_digest_is_domain_separated() {
+        let ch = challenge(&[9u8; 32], 1);
+        let mut buf = [0u8; 40];
+        buf[..32].copy_from_slice(&ch);
+        buf[32..].copy_from_slice(&7u64.to_le_bytes());
+        let d = digest(&ch, 7);
+        assert_ne!(d, hash::hash(&buf), "PoW digest must not be a plain hash");
+        assert_eq!(d, hash::derive_key(hash::labels::POW_SOLVE, &buf));
+        assert_ne!(hash::labels::POW_SOLVE, hash::labels::POW);
     }
 
     #[test]
