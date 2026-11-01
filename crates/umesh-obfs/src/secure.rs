@@ -38,6 +38,7 @@ pub struct SecureStream<S> {
     send_ctr: u64,
     recv_ctr: u64,
     shaping: ShapingPolicy,
+    channel_binding: [u8; 32],
 }
 
 impl<S> SecureStream<S>
@@ -55,7 +56,13 @@ where
             send_ctr: 0,
             recv_ctr: 0,
             shaping,
+            channel_binding: keys.channel_binding,
         }
+    }
+
+    /// This session's channel binding (see [`SessionKeys::channel_binding`]).
+    pub fn channel_binding(&self) -> &[u8; 32] {
+        &self.channel_binding
     }
 
     /// Send one application message (≤ [`MAX_MESSAGE`] bytes) as a padded, encrypted record.
@@ -119,6 +126,7 @@ mod tests {
             recv: AeadKey::from_bytes([2; 32]),
             send_dir: DIR_C2S,
             recv_dir: DIR_S2C,
+            channel_binding: [7; 32],
         }
     }
 
@@ -128,6 +136,7 @@ mod tests {
             recv: AeadKey::from_bytes([1; 32]),
             send_dir: DIR_S2C,
             recv_dir: DIR_C2S,
+            channel_binding: [7; 32],
         }
     }
 
@@ -172,6 +181,7 @@ mod tests {
             recv: AeadKey::from_bytes([9; 32]),
             send_dir: DIR_S2C,
             recv_dir: DIR_C2S,
+            channel_binding: [7; 32],
         };
         let mut server = SecureStream::new(b, bad, ShapingPolicy::none());
         let srv = tokio::spawn(async move { server.recv().await });
@@ -187,5 +197,30 @@ mod tests {
             s.send(&vec![0u8; MAX_MESSAGE + 1]).await,
             Err(ObfsError::RecordTooLarge)
         ));
+    }
+
+    /// Audit F6 regression: aggressive shaping produced records whose length was always
+    /// ≡ 5 + 40 + 16 (mod 512) — a static length signature. Random padding now rides on top of the
+    /// bucket, so the residue varies.
+    #[tokio::test]
+    async fn aggressive_padding_is_not_a_constant_bucket_residue() {
+        let (a, mut b) = tokio::io::duplex(1024 * 1024);
+        let mut s = SecureStream::new(
+            a,
+            client_keys(),
+            ShapingPolicy {
+                iat_jitter_ms: 0,
+                ..ShapingPolicy::aggressive()
+            },
+        );
+        let mut residues = std::collections::HashSet::new();
+        for n in [1usize, 50, 600, 3000, 9999] {
+            for _ in 0..8 {
+                s.send(&vec![0u8; n]).await.unwrap();
+                let r = crate::wire::read_record_raw(&mut b).await.unwrap();
+                residues.insert(r.len() % 512);
+            }
+        }
+        assert!(residues.len() > 4, "residues {residues:?}");
     }
 }

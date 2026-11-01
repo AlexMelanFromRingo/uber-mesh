@@ -79,6 +79,117 @@ pub fn parse_record(buf: &[u8]) -> Option<(&[u8], usize)> {
     Some((&buf[HEADER_LEN..end], end))
 }
 
+/// Smallest plausible ClientHello record body (handshake header + version + random + minimal
+/// session/cipher/compression vectors). Anything shorter is not a real ClientHello.
+pub const MIN_CLIENT_HELLO_RECORD: usize = 40;
+
+/// Incremental verdict on the bytes a server has read so far from a fresh connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HelloPrefix {
+    /// Plausible so far; the complete first record is this many bytes long in total (header
+    /// included), or the header itself (`5`) is not complete yet.
+    NeedMore(usize),
+    /// The first record is complete (`buf.len()` bytes).
+    Complete,
+    /// Not a plausible TLS ClientHello record (wrong content type / version, implausible length,
+    /// or not a ClientHello handshake message) — hand the connection to the probe response now.
+    Implausible,
+}
+
+/// Classify the first bytes of an inbound connection: is this (the start of) one plausible TLS
+/// handshake record carrying a ClientHello (`16 03 01|03 <len>` with
+/// `MIN_CLIENT_HELLO_RECORD ≤ len ≤ MAX_RECORD`, handshake type `0x01` and a consistent handshake
+/// length)? Pure and total, so it is fuzzed together with the gate (`fuzz/fuzz_targets/server_gate.rs`).
+///
+/// `buf` must never contain more than the first record; the async reader enforces this by only
+/// ever reading up to the length this function asks for.
+pub fn classify_client_hello_prefix(buf: &[u8]) -> HelloPrefix {
+    if let Some(&b) = buf.first()
+        && b != 0x16
+    {
+        return HelloPrefix::Implausible;
+    }
+    if let Some(&b) = buf.get(1)
+        && b != 0x03
+    {
+        return HelloPrefix::Implausible;
+    }
+    if let Some(&b) = buf.get(2)
+        && b != 0x01
+        && b != 0x03
+    {
+        return HelloPrefix::Implausible;
+    }
+    if buf.len() < HEADER_LEN {
+        return HelloPrefix::NeedMore(HEADER_LEN);
+    }
+    let len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+    if !(MIN_CLIENT_HELLO_RECORD..=MAX_RECORD).contains(&len) {
+        return HelloPrefix::Implausible;
+    }
+    if let Some(&t) = buf.get(5)
+        && t != 0x01
+    {
+        return HelloPrefix::Implausible;
+    }
+    if buf.len() >= 9 {
+        let hs_len = ((buf[6] as usize) << 16) | ((buf[7] as usize) << 8) | buf[8] as usize;
+        if hs_len + 4 != len {
+            return HelloPrefix::Implausible;
+        }
+    }
+    let total = HEADER_LEN + len;
+    match buf.len().cmp(&total) {
+        std::cmp::Ordering::Less => HelloPrefix::NeedMore(total),
+        std::cmp::Ordering::Equal => HelloPrefix::Complete,
+        std::cmp::Ordering::Greater => HelloPrefix::Implausible,
+    }
+}
+
+/// Why [`read_client_hello_record`] stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HelloRead {
+    /// A complete, plausible ClientHello record was read (and nothing beyond it).
+    Complete,
+    /// The opening bytes are not a plausible ClientHello record.
+    Implausible,
+    /// The peer closed (or the socket errored) before a complete record arrived.
+    Closed,
+    /// The deadline passed before a complete record arrived.
+    TimedOut,
+}
+
+/// Read the first record of an inbound connection, **keeping every byte read** (returned in all
+/// cases so a fallback proxy can forward it verbatim), never reading past the end of the first
+/// record, and giving up immediately once the bytes stop looking like a ClientHello.
+pub async fn read_client_hello_record<R: AsyncRead + Unpin>(
+    r: &mut R,
+    deadline: tokio::time::Instant,
+) -> (Vec<u8>, HelloRead) {
+    let mut buf: Vec<u8> = Vec::with_capacity(2048);
+    loop {
+        let need = match classify_client_hello_prefix(&buf) {
+            HelloPrefix::Complete => return (buf, HelloRead::Complete),
+            HelloPrefix::Implausible => return (buf, HelloRead::Implausible),
+            HelloPrefix::NeedMore(total) => total,
+        };
+        let old = buf.len();
+        buf.resize(need, 0);
+        let res = tokio::time::timeout_at(deadline, r.read(&mut buf[old..need])).await;
+        match res {
+            Ok(Ok(n)) if n > 0 => buf.truncate(old + n),
+            Ok(_) => {
+                buf.truncate(old);
+                return (buf, HelloRead::Closed);
+            }
+            Err(_) => {
+                buf.truncate(old);
+                return (buf, HelloRead::TimedOut);
+            }
+        }
+    }
+}
+
 /// Fraction of set bits per byte over `data` (a coarse proxy for the GFW's popcount heuristic).
 /// Fully-random/encrypted payloads sit near 4.0; structured/text data sits lower.
 pub fn popcount_per_byte(data: &[u8]) -> f64 {
@@ -153,6 +264,60 @@ mod tests {
             .map(|i| (i.wrapping_mul(53) ^ 0xa7) as u8)
             .collect();
         assert!(looks_fully_encrypted(&raw) || popcount_per_byte(&raw) < 3.4);
+    }
+
+    #[test]
+    fn hello_prefix_classifier() {
+        use HelloPrefix::*;
+        assert_eq!(classify_client_hello_prefix(&[]), NeedMore(5));
+        assert_eq!(classify_client_hello_prefix(b"G"), Implausible);
+        assert_eq!(classify_client_hello_prefix(b"GET / HTTP/1.1"), Implausible);
+        assert_eq!(classify_client_hello_prefix(&[0x16, 0x03]), NeedMore(5));
+        assert_eq!(
+            classify_client_hello_prefix(&[0x16, 0x03, 0x02]),
+            Implausible
+        );
+        // Oversized declared length ⇒ implausible immediately (no waiting for 18 KiB).
+        assert_eq!(
+            classify_client_hello_prefix(&[0x16, 0x03, 0x01, 0x48, 0x01]),
+            Implausible
+        );
+        assert_eq!(
+            classify_client_hello_prefix(&[0x16, 0x03, 0x01, 0x00, 0x05]),
+            Implausible
+        );
+        assert_eq!(
+            classify_client_hello_prefix(&[0x16, 0x03, 0x01, 0x00, 0x40]),
+            NeedMore(69)
+        );
+        // Handshake type must be ClientHello and the handshake length consistent.
+        assert_eq!(
+            classify_client_hello_prefix(&[0x16, 3, 1, 0, 0x40, 2]),
+            Implausible
+        );
+        assert_eq!(
+            classify_client_hello_prefix(&[0x16, 3, 1, 0, 0x40, 1, 0, 0, 0x3c]),
+            NeedMore(69)
+        );
+        assert_eq!(
+            classify_client_hello_prefix(&[0x16, 3, 1, 0, 0x40, 1, 0, 0, 0x3d]),
+            Implausible
+        );
+        let mut full = vec![0x16, 3, 1, 0, 0x40, 1, 0, 0, 0x3c];
+        full.resize(69, 0);
+        assert_eq!(classify_client_hello_prefix(&full), Complete);
+    }
+
+    #[tokio::test]
+    async fn hello_reader_keeps_all_bytes_and_stops_early() {
+        let (mut a, mut b) = tokio::io::duplex(4096);
+        a.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (got, why) = read_client_hello_record(&mut b, deadline).await;
+        assert_eq!(why, HelloRead::Implausible);
+        assert!(b"GET / HTTP/1.1".starts_with(&got) && !got.is_empty());
     }
 
     #[test]

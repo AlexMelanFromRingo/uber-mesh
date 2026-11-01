@@ -27,7 +27,7 @@ const PROBE_REC_LEN: usize = 1264;
 async fn establishes_and_exchanges_data() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let psk = ObfsPsk([7u8; 32]);
+    let psk = ObfsPsk::new([7u8; 32]);
     let psk_s = psk.clone();
 
     let server = tokio::spawn(async move {
@@ -55,7 +55,9 @@ async fn active_probe_gets_silence() {
     let addr = listener.local_addr().unwrap();
 
     let server = tokio::spawn(async move {
-        let r = ObfsTcp::accept(&listener, &ObfsPsk([7u8; 32]), ShapingPolicy::none()).await;
+        let (mut s, _) = listener.accept().await.unwrap();
+        let r =
+            server_handshake_probe(&mut s, &ObfsPsk::new([7u8; 32]), &ProbeResponse::Silence).await;
         assert!(
             matches!(r, Err(ObfsError::AuthFailed)),
             "probe must fail the gate"
@@ -103,7 +105,7 @@ async fn first_flight_is_a_client_hello() {
         // drop the connection — the client's handshake will then error, which is fine here.
     });
 
-    let _ = ObfsTcp::connect(addr, &ObfsPsk([1u8; 32]), ShapingPolicy::none()).await;
+    let _ = ObfsTcp::connect(addr, &ObfsPsk::new([1u8; 32]), ShapingPolicy::none()).await;
     recorder.await.unwrap();
 
     let first = captured.lock().await.clone();
@@ -119,10 +121,10 @@ async fn first_flight_is_a_client_hello() {
         "censor classifier must not flag the opening"
     );
     // ...and it parses as a real ClientHello carrying the 1216-byte PQ-hybrid key_share.
-    let (_sid, key_share) = umesh_obfs::tls::parse_client_hello(&first)
+    let info = umesh_obfs::tls::parse_client_hello(&first)
         .expect("first flight must parse as a TLS 1.3 ClientHello");
     assert_eq!(
-        key_share.len(),
+        info.hybrid_share.len(),
         1184 + 32,
         "X25519MLKEM768 key_share = ml-kem-768 ek ‖ x25519 pub"
     );
@@ -143,7 +145,7 @@ async fn rotates_past_dead_endpoint() {
     // Live endpoint: a real obfs server.
     let good = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let good_addr = good.local_addr().unwrap().to_string();
-    let psk = ObfsPsk([5u8; 32]);
+    let psk = ObfsPsk::new([5u8; 32]);
     let psk_s = psk.clone();
     tokio::spawn(async move {
         if let Ok((mut s, _)) = ObfsTcp::accept(&good, &psk_s, ShapingPolicy::none()).await {
@@ -186,7 +188,7 @@ async fn probe_is_proxied_to_cover_site() {
     let probe_policy = ProbeResponse::Fallback(up_addr);
     tokio::spawn(async move {
         if let Ok((mut s, _)) = server.accept().await {
-            let r = server_handshake_probe(&mut s, &ObfsPsk([1u8; 32]), &probe_policy).await;
+            let r = server_handshake_probe(&mut s, &ObfsPsk::new([1u8; 32]), &probe_policy).await;
             assert!(matches!(r, Err(ObfsError::AuthFailed)));
         }
     });

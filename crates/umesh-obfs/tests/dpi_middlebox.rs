@@ -6,8 +6,9 @@
 //!   2. a raw high-entropy flow (what a naive encrypted proxy looks like) is **blocked** — proving
 //!      the box genuinely censors, so (1) is meaningful.
 //!
-//! (SNI filtering is orthogonal: the obfs flow presents no TLS ClientHello/SNI, so an SNI blocklist
-//! has nothing to match; the REALITY-style fallback handles active probers separately.)
+//! (SNI filtering is orthogonal: the obfs flow presents a per-connection cover SNI from a configured
+//! list, so an SNI blocklist must block the cover domains themselves; the REALITY-style fallback
+//! handles active probers separately.)
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -77,7 +78,7 @@ async fn spawn_obfs_echo(psk: ObfsPsk) -> u16 {
 
 #[tokio::test]
 async fn obfs_passes_entropy_dpi_box() {
-    let psk = ObfsPsk([3u8; 32]);
+    let psk = ObfsPsk::new([3u8; 32]);
     let upstream = spawn_obfs_echo(psk.clone()).await;
     let allowed = Arc::new(AtomicUsize::new(0));
     let blocked = Arc::new(AtomicUsize::new(0));
@@ -103,7 +104,7 @@ async fn obfs_passes_entropy_dpi_box() {
 
 #[tokio::test]
 async fn raw_encrypted_flow_is_blocked() {
-    let psk = ObfsPsk([4u8; 32]);
+    let psk = ObfsPsk::new([4u8; 32]);
     let upstream = spawn_obfs_echo(psk).await;
     let allowed = Arc::new(AtomicUsize::new(0));
     let blocked = Arc::new(AtomicUsize::new(0));
@@ -209,7 +210,7 @@ async fn spawn_echo_server() -> u16 {
 
 #[tokio::test]
 async fn obfs_survives_active_probing() {
-    let psk = ObfsPsk([5u8; 32]);
+    let psk = ObfsPsk::new([5u8; 32]);
     let upstream = spawn_obfs_echo(psk.clone()).await;
     let (allowed, blocked) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     let box_port = probing_dpi(upstream, allowed.clone(), blocked.clone()).await;
@@ -296,7 +297,7 @@ async fn state_machine_dpi(
 
 #[tokio::test]
 async fn obfs_passes_tls_state_machine_dpi() {
-    let psk = ObfsPsk([6u8; 32]);
+    let psk = ObfsPsk::new([6u8; 32]);
     let upstream = spawn_obfs_echo(psk.clone()).await;
     let (allowed, blocked) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     let box_port = state_machine_dpi(upstream, allowed.clone(), blocked.clone()).await;
