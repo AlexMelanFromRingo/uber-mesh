@@ -92,6 +92,9 @@ jobs:
       # libFuzzer needs its own instrumentation; don't inherit the workspace -D warnings flags.
       RUSTFLAGS: ""
       FUZZ_SECONDS: "30"
+      # install-action ships a musl-built cargo-fuzz, which would default to the musl target —
+      # incompatible with the address sanitizer. Always fuzz on the glibc target.
+      FUZZ_TARGET: x86_64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -106,7 +109,7 @@ jobs:
         with:
           workspaces: fuzz
       - name: build all fuzz targets
-        run: cargo +nightly fuzz build
+        run: cargo +nightly fuzz build --target "$FUZZ_TARGET"
       - name: short run of every target in fuzz/fuzz_targets
         # Glob the directory (not a hard-coded list) so new harnesses are exercised automatically;
         # a .rs file that is not registered as a [[bin]] in fuzz/Cargo.toml fails the job.
@@ -120,7 +123,7 @@ jobs:
           for f in "${targets[@]}"; do
             t="$(basename "$f" .rs)"
             echo "::group::fuzz $t (${FUZZ_SECONDS}s)"
-            cargo +nightly fuzz run "$t" -- -max_total_time="${FUZZ_SECONDS}" -rss_limit_mb=2048
+            cargo +nightly fuzz run --target "$FUZZ_TARGET" "$t" -- -max_total_time="${FUZZ_SECONDS}" -rss_limit_mb=2048
             echo "::endgroup::"
           done
       - name: upload crash artifacts
