@@ -3840,6 +3840,7 @@ dependencies = [
  "bincode",
  "futures",
  "libp2p",
+ "rand 0.8.8",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",

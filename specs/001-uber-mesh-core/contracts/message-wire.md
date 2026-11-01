@@ -71,7 +71,8 @@ seqnos each) are capacity-bounded, and entries expire `2 × skew_window` after l
 replays of the messages they protected fail step 7 anyway). When the sender table is full, the
 least-recently-used window is evicted and its highest accepted timestamp is kept as a **per-sender floor**
 (exact table, 65 536 entries, `2 × skew_window` expiry). If that table must drop a still-live floor, the
-floor is **folded** (max) into one of 4 096 hashed buckets instead — a floor is never lost, so a replay of an
+floor is **folded** (max) into one of 4 096 buckets instead (bucket index = keyed BLAKE3 of the sender id under a
+random per-node secret, so no one can aim identities at a chosen sender's bucket) — a floor is never lost, so a replay of an
 evicted sender's message is always refused (`Replay`, gossipsub `Ignore`, no penalty), also after the
 sender is tracked again. Message timestamps may be at most **30 s in the future** (5 min in the past), so no
 floor exceeds the receiver's clock by more than 30 s: a future-dated flood constrains only its own identities,

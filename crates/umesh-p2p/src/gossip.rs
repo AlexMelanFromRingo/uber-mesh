@@ -329,6 +329,9 @@ pub struct ReplayGuard {
     evicted: BoundedMap<[u8; 32], (u64, u64)>,
     /// Fallback floors for exact floors evicted while still live (see [`FLOOR_BUCKETS`]).
     buckets: Box<[u64]>,
+    /// Secret, per-node key for the bucket index: without it nobody can grind identities that land
+    /// in a chosen (victim's) bucket.
+    bucket_key: Hash32,
 }
 
 impl ReplayGuard {
@@ -345,6 +348,12 @@ impl ReplayGuard {
             skew_ms,
             evicted: BoundedMap::new(DEFAULT_EVICTED_CAP),
             buckets: vec![0u64; FLOOR_BUCKETS].into_boxed_slice(),
+            bucket_key: {
+                use rand::RngCore;
+                let mut k = [0u8; 32];
+                rand::rngs::OsRng.fill_bytes(&mut k);
+                k
+            },
         }
     }
 
@@ -363,15 +372,17 @@ impl ReplayGuard {
         self.senders.contains_key(sender)
     }
 
-    fn bucket(sender: &[u8; 32]) -> usize {
-        // `sender` is a BLAKE3 hash, so its bytes are already uniform.
-        u32::from_le_bytes(sender[..4].try_into().expect("4 bytes")) as usize % FLOOR_BUCKETS
+    /// Bucket index under the node's secret key (keyed BLAKE3): an attacker can't predict which
+    /// bucket an identity maps to here, so it can't target a particular sender's bucket.
+    fn bucket(&self, sender: &[u8; 32]) -> usize {
+        let h = hash::keyed_mac(&self.bucket_key, sender);
+        u32::from_le_bytes(h[..4].try_into().expect("4 bytes")) as usize % FLOOR_BUCKETS
     }
 
     /// Replay floor for an untracked sender: its exact floor, else its bucket's folded floor.
     fn floor_of(&self, sender: &[u8; 32]) -> u64 {
         let exact = self.evicted.get(sender).map(|&(f, _)| f).unwrap_or(0);
-        exact.max(self.buckets[Self::bucket(sender)])
+        exact.max(self.buckets[self.bucket(sender)])
     }
 
     /// Remember an evicted window's floor; if the exact table must drop a still-live floor to make
@@ -381,7 +392,8 @@ impl ReplayGuard {
             && self.evicted.is_full()
             && let Some((old, (old_floor, _))) = self.evicted.pop_oldest()
         {
-            let b = &mut self.buckets[Self::bucket(&old)];
+            let idx = self.bucket(&old);
+            let b = &mut self.buckets[idx];
             *b = (*b).max(old_floor);
         }
         self.evicted.insert(sender, (floor, now_ms));
@@ -745,5 +757,25 @@ mod tests {
         );
         let (ok, _) = msg(4, 1, 1000 + MAX_FUTURE_MS, b"x");
         assert!(validate(&ok, &mut g, 1000).is_ok());
+    }
+    /// Review round 5: the fallback bucket of a sender must not be predictable from its public id
+    /// (or an attacker could grind identities into a chosen victim's bucket). Two guards (= two
+    /// nodes) map the same senders to unrelated buckets.
+    #[test]
+    fn bucket_index_is_keyed_per_node() {
+        let (a, b) = (ReplayGuard::default(), ReplayGuard::default());
+        let same = (0u8..64)
+            .filter(|i| {
+                let s = hash::hash(&[*i]);
+                a.bucket(&s) == b.bucket(&s)
+            })
+            .count();
+        assert!(same < 8, "bucket index looks unkeyed: {same}/64 identical");
+        let s = hash::hash(b"sender");
+        let prefix = u32::from_le_bytes(s[..4].try_into().unwrap()) as usize % FLOOR_BUCKETS;
+        assert!(
+            (0..8).any(|_| ReplayGuard::default().bucket(&s) != prefix),
+            "bucket must not be the public-id prefix"
+        );
     }
 }

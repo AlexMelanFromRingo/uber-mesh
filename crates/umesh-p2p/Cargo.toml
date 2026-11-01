@@ -10,6 +10,7 @@ description = "libp2p mesh behaviour for uber-mesh (signed gossip, discovery, NA
 [dependencies]
 umesh-crypto.workspace = true
 umesh-obfs.workspace = true
+rand.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
