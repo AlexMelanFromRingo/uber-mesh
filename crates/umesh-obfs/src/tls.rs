@@ -1,23 +1,64 @@
-//! Chrome-shaped TLS 1.3 ClientHello / ServerHello construction and **strict** parsing.
+//! Chrome-exact TLS 1.3 ClientHello / cover-shaped ServerHello construction and **strict** parsing.
 //!
-//! The obfs handshake rides inside what looks, on the wire, like a modern Chrome (stable, 2025-26)
-//! TLS 1.3 handshake with post-quantum key agreement (constitution Principle II — no static
-//! fingerprint):
+//! # ClientHello template (pinned)
 //!
-//! - **ClientHello** follows Chrome's template: GREASE (RFC 8701) cipher / group / version /
-//!   extension values chosen per connection, Chrome's 15-suite cipher list, Chrome's extension set
-//!   (`server_name`, `extended_master_secret`, `renegotiation_info`, `supported_groups`
-//!   `[GREASE, X25519MLKEM768, x25519, secp256r1, secp384r1]`, `ec_point_formats`, `session_ticket`,
-//!   ALPN `[h2, http/1.1]`, `status_request`, `signature_algorithms`, `signed_certificate_timestamp`,
-//!   `key_share [GREASE, X25519MLKEM768, x25519]`, `psk_key_exchange_modes`, `supported_versions`,
-//!   `compress_certificate` (brotli), `application_settings`, GREASE `encrypted_client_hello`), and
-//!   Chrome's **per-connection extension-order permutation** (GREASE extensions pinned first/last).
-//!   The size therefore varies per connection (SNI, ECH GREASE payload) and the order is never
-//!   static.
-//! - The `X25519MLKEM768` (`0x11EC`) share uses the real IANA layout: client = ML-KEM-768
-//!   encapsulation key (1184 B) ‖ X25519 (32 B); server = ML-KEM-768 ciphertext (1088 B) ‖ X25519
-//!   (32 B). This carries the hybrid KEM material of `umesh_crypto::kem` verbatim.
-//! - **ServerHello** carries `supported_versions` + the hybrid `key_share` (OpenSSL order).
+//! The obfs handshake rides inside what is, on the wire, the default ClientHello of **desktop Chrome
+//! stable 133 and later** (BoringSSL, x86-64 with AES-NI, first connection to an origin — no
+//! resumption, so no `pre_shared_key`/`early_data`; the hello is > 512 B so BoringSSL emits no
+//! `padding`). Source: BoringSSL `ssl/extensions.cc` / `handshake_client.cc` defaults as shipped
+//! in Chrome (`X25519MLKEM768` default since Chrome 131, new ALPS codepoint `0x44cd` since
+//! Chrome 133); the resulting JA4 is the public Chrome-133+ value [`CHROME_JA4`]
+//! (`t13d1516h2_8daaf6152771_d8a2da3f94cd`), asserted for every generated hello by
+//! `tests/fingerprint.rs`, which also recomputes JA3 (it varies per connection, as Chrome's does).
+//!
+//! ```text
+//! record            16 0301 <len>                      (record-layer version 0x0301, one record)
+//! handshake         01 <u24 len>
+//! legacy_version    0303
+//! random            32 B random
+//! legacy_session_id 32 B                               (obfs gate tag; Chrome: 32 random bytes)
+//! cipher_suites     GREASE, 1301 1302 1303 c02b c02f c02c c030 cca9 cca8 c013 c014 009c 009d 002f 0035
+//! compression       01 00
+//! extensions        GREASE_1 (empty)                   — always first
+//!                   ┌ shuffled uniformly per connection (Chrome's extension permutation) ┐
+//!                   │ 0000 server_name        00 <len> 00 <len> host   (omitted for an IP / invalid) │
+//!                   │ 0017 extended_ms        empty                                        │
+//!                   │ ff01 renegotiation_info 00                                           │
+//!                   │ 000a supported_groups   GREASE, 11ec, 001d, 0017, 0018               │
+//!                   │ 000b ec_point_formats   01 00                                        │
+//!                   │ 0023 session_ticket     empty                                        │
+//!                   │ 0010 ALPN               "h2", "http/1.1"                             │
+//!                   │ 0005 status_request     01 0000 0000 (OCSP, no responder ids/exts)   │
+//!                   │ 000d signature_algs     0403 0804 0401 0503 0805 0501 0806 0601      │
+//!                   │ 0012 SCT                empty                                        │
+//!                   │ 0033 key_share          GREASE(1 B: 00), 11ec(1216 B), 001d(32 B)    │
+//!                   │ 002d psk_kex_modes      01 01 (psk_dhe_ke)                           │
+//!                   │ 002b supported_versions GREASE, 0304, 0303                           │
+//!                   │ 001b compress_cert      02 0002 (brotli)                             │
+//!                   │ 44cd application_settings (ALPS, Chrome 133+ codepoint) "h2"         │
+//!                   │ fe0d encrypted_client_hello GREASE: outer, 0001/0001, random config_id,│
+//!                   │      enc 32 B, payload 32·{4..7}+16 = 144|176|208|240 B random     │
+//!                   └──────────────────────────────────────────────────────────────────────┘
+//!                   GREASE_2 (body 00), ≠ GREASE_1      — always last
+//! ```
+//!
+//! GREASE values (RFC 8701) are drawn per connection exactly where BoringSSL places them: cipher
+//! (first suite), group (first `supported_groups` entry **and** the 1-byte key share), version (first
+//! `supported_versions` entry), and the two extensions (first + last, distinct). The
+//! `X25519MLKEM768` (`0x11EC`) share uses the IANA layout — client = ML-KEM-768 encapsulation key
+//! (1184 B) ‖ X25519 (32 B) — and carries `umesh_crypto::kem`'s initiator message verbatim; the
+//! separate `x25519` share is a random 32-byte string shaped like a public key.
+//!
+//! **Maintenance:** when Chrome stable changes its hello (new group/codepoint, ECH payload rule),
+//! update this template, the [`CHROME_JA4`] constant, the KAT in `tests/handshake_security.rs`, and
+//! the wire contract together.
+//!
+//! # ServerHello
+//!
+//! The ServerHello is built to a [`ServerHelloShape`] — cipher suite, selected group
+//! (`X25519MLKEM768` carrying ML-KEM-768 ct ‖ X25519, or plain `x25519`) and extension order — so a
+//! server can reproduce exactly what its real cover site answers to this ClientHello
+//! (`crate::cover::CoverProfile`).
 //!
 //! Parsers are strict and bounds-checked: exact record/handshake length agreement, no duplicate
 //! extensions, exact key_share sizes. They are fuzz targets (`fuzz/fuzz_targets/client_hello.rs`,
@@ -37,8 +78,14 @@ const GROUP_SECP384R1: u16 = 0x0018;
 pub const HYBRID_CLIENT_SHARE_LEN: usize = 1184 + 32;
 /// Server `X25519MLKEM768` share length: ML-KEM-768 ct (1088) ‖ X25519 (32).
 pub const HYBRID_SERVER_SHARE_LEN: usize = 1088 + 32;
-/// The TLS 1.3 suite the server "selects" (TLS_AES_128_GCM_SHA256, what servers pick for Chrome).
+/// The TLS 1.3 suite the server selects by default (TLS_AES_128_GCM_SHA256, what most servers pick
+/// for Chrome).
 pub const SELECTED_CIPHER: u16 = 0x1301;
+/// The TLS 1.3 suites Chrome offers; a ServerHello must select one of them.
+pub const TLS13_SUITES: [u16; 3] = [0x1301, 0x1302, 0x1303];
+/// The JA4 fingerprint of desktop Chrome stable 133+ — and of every ClientHello [`build_client_hello`]
+/// emits with a valid SNI (`tests/fingerprint.rs`).
+pub const CHROME_JA4: &str = "t13d1516h2_8daaf6152771_d8a2da3f94cd";
 
 /// Byte offset of the 32-byte `legacy_session_id` inside a ClientHello/ServerHello **record**:
 /// record header (5) + handshake header (4) + legacy_version (2) + random (32) + sid length (1).
@@ -285,29 +332,117 @@ pub fn build_client_hello<R: RngCore + ?Sized>(
     wrap_handshake(HS_CLIENT_HELLO, &body, 0x0301)
 }
 
-/// Build a complete ServerHello record echoing `session_id` and carrying the `X25519MLKEM768`
-/// server share (ML-KEM-768 ct ‖ X25519, 1120 B). The server random is drawn from `rng`.
+/// The key-share group a TLS 1.3 ServerHello selects (the two groups of the Chrome template a
+/// server can pick without a HelloRetryRequest).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServerGroup {
+    /// `X25519MLKEM768` (`0x11EC`): share = ML-KEM-768 ciphertext (1088) ‖ X25519 (32).
+    X25519MlKem768,
+    /// `x25519` (`0x001D`): share = X25519 (32). The obfs server then carries the ML-KEM-768
+    /// ciphertext, masked, inside the encrypted flight (see `handshake`).
+    X25519,
+}
+
+impl ServerGroup {
+    /// IANA codepoint.
+    pub fn codepoint(self) -> u16 {
+        match self {
+            ServerGroup::X25519MlKem768 => GROUP_X25519MLKEM768,
+            ServerGroup::X25519 => GROUP_X25519,
+        }
+    }
+
+    /// Length of the server key share for this group.
+    pub fn share_len(self) -> usize {
+        match self {
+            ServerGroup::X25519MlKem768 => HYBRID_SERVER_SHARE_LEN,
+            ServerGroup::X25519 => 32,
+        }
+    }
+
+    fn from_codepoint(g: u16) -> Option<Self> {
+        match g {
+            GROUP_X25519MLKEM768 => Some(ServerGroup::X25519MlKem768),
+            GROUP_X25519 => Some(ServerGroup::X25519),
+            _ => None,
+        }
+    }
+}
+
+/// The observable, non-random shape of a TLS 1.3 ServerHello answering the Chrome template: which
+/// suite and group the server selects and in which order it writes its two extensions. Everything
+/// else (random, echoed session_id, share bytes) is per connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServerHelloShape {
+    /// Selected cipher suite (one of [`TLS13_SUITES`]).
+    pub cipher_suite: u16,
+    /// Selected key-share group.
+    pub group: ServerGroup,
+    /// `key_share` before `supported_versions` (BoringSSL order) instead of after (OpenSSL / Go).
+    pub key_share_first: bool,
+}
+
+impl Default for ServerHelloShape {
+    /// `TLS_AES_128_GCM_SHA256`, `X25519MLKEM768`, `supported_versions` first (OpenSSL order).
+    fn default() -> Self {
+        ServerHelloShape {
+            cipher_suite: SELECTED_CIPHER,
+            group: ServerGroup::X25519MlKem768,
+            key_share_first: false,
+        }
+    }
+}
+
+impl ServerHelloShape {
+    /// Total record length (header included) of a ServerHello of this shape.
+    pub fn record_len(&self) -> usize {
+        // record hdr 5 + hs hdr 4 + version 2 + random 32 + sid 1+32 + suite 2 + comp 1 + ext len 2
+        // + supported_versions (4 + 2) + key_share (4 + 2 + 2 + share).
+        5 + 4 + 2 + 32 + 1 + SESSION_ID_LEN + 2 + 1 + 2 + 6 + 8 + self.group.share_len()
+    }
+}
+
+/// Build a complete ServerHello record of the default [`ServerHelloShape`] echoing `session_id`
+/// and carrying the `X25519MLKEM768` server share (ML-KEM-768 ct ‖ X25519, 1120 B).
 pub fn build_server_hello<R: RngCore + ?Sized>(
     rng: &mut R,
     session_id: &[u8; 32],
     hybrid_share: &[u8],
 ) -> Vec<u8> {
+    build_server_hello_shaped(rng, session_id, &ServerHelloShape::default(), hybrid_share)
+}
+
+/// Build a complete ServerHello record of `shape`, echoing `session_id` and carrying `share` for
+/// `shape.group` (the caller passes exactly [`ServerGroup::share_len`] bytes). The server random is
+/// drawn from `rng`.
+pub fn build_server_hello_shaped<R: RngCore + ?Sized>(
+    rng: &mut R,
+    session_id: &[u8; 32],
+    shape: &ServerHelloShape,
+    share: &[u8],
+) -> Vec<u8> {
+    debug_assert_eq!(share.len(), shape.group.share_len());
     let mut random = [0u8; 32];
     rng.fill_bytes(&mut random);
 
-    let mut exts = ext(EXT_SUPPORTED_VERSIONS, &TLS13.to_be_bytes());
-    let mut share = Vec::with_capacity(4 + hybrid_share.len());
-    put_u16(&mut share, GROUP_X25519MLKEM768);
-    put_len16(&mut share, hybrid_share.len());
-    share.extend_from_slice(hybrid_share);
-    exts.extend(ext(EXT_KEY_SHARE, &share));
+    let versions = ext(EXT_SUPPORTED_VERSIONS, &TLS13.to_be_bytes());
+    let mut ks = Vec::with_capacity(4 + share.len());
+    put_u16(&mut ks, shape.group.codepoint());
+    put_len16(&mut ks, share.len());
+    ks.extend_from_slice(share);
+    let key_share = ext(EXT_KEY_SHARE, &ks);
+    let exts = if shape.key_share_first {
+        [key_share, versions].concat()
+    } else {
+        [versions, key_share].concat()
+    };
 
     let mut body = Vec::with_capacity(2 + 32 + 33 + 3 + 2 + exts.len());
     put_u16(&mut body, TLS12);
     body.extend_from_slice(&random);
     body.push(SESSION_ID_LEN as u8);
     body.extend_from_slice(session_id);
-    put_u16(&mut body, SELECTED_CIPHER);
+    put_u16(&mut body, shape.cipher_suite);
     body.push(0); // compression
     put_len16(&mut body, exts.len());
     body.extend_from_slice(&exts);
@@ -513,15 +648,17 @@ pub fn parse_client_hello(rec: &[u8]) -> Option<ClientHelloInfo> {
 pub struct ServerHelloInfo {
     /// The echoed `legacy_session_id`.
     pub session_id: [u8; 32],
-    /// The selected cipher suite.
-    pub cipher_suite: u16,
-    /// The `X25519MLKEM768` server share (exactly [`HYBRID_SERVER_SHARE_LEN`] bytes).
-    pub hybrid_share: Vec<u8>,
+    /// Suite, group and extension order (the reproducible shape).
+    pub shape: ServerHelloShape,
+    /// The server key share for `shape.group` (exactly [`ServerGroup::share_len`] bytes).
+    pub key_share: Vec<u8>,
 }
 
-/// Strictly parse a single ServerHello **record**. Requires TLS 1.3 (`supported_versions` = 0x0304),
-/// an `X25519MLKEM768` share of exactly [`HYBRID_SERVER_SHARE_LEN`] bytes, null compression, a
-/// 32-byte session_id, and no other extensions; rejects HelloRetryRequest. Never panics.
+/// Strictly parse a single ServerHello **record**. Requires TLS 1.3 (`supported_versions` =
+/// 0x0304), exactly the two extensions `supported_versions` and `key_share` (in either order), a
+/// TLS 1.3 suite Chrome offers ([`TLS13_SUITES`]), an `X25519MLKEM768` share of exactly
+/// [`HYBRID_SERVER_SHARE_LEN`] bytes or an `x25519` share of 32 bytes, null compression and a 32-byte
+/// session_id; rejects HelloRetryRequest. Never panics.
 pub fn parse_server_hello(rec: &[u8]) -> Option<ServerHelloInfo> {
     let mut r = handshake_body(rec, HS_SERVER_HELLO, false)?;
     if r.u16()? != TLS12 {
@@ -535,6 +672,9 @@ pub fn parse_server_hello(rec: &[u8]) -> Option<ServerHelloInfo> {
     }
     let session_id: [u8; 32] = r.take(SESSION_ID_LEN)?.try_into().ok()?;
     let cipher_suite = r.u16()?;
+    if !TLS13_SUITES.contains(&cipher_suite) {
+        return None;
+    }
     if r.u8()? != 0 {
         return None;
     }
@@ -543,33 +683,48 @@ pub fn parse_server_hello(rec: &[u8]) -> Option<ServerHelloInfo> {
         return None;
     }
 
+    let exts = extensions(ext_block)?;
+    if exts.len() != 2 {
+        return None;
+    }
     let mut version_ok = false;
-    let mut hybrid_share = None;
-    for (etype, body) in extensions(ext_block)? {
-        match etype {
-            EXT_SUPPORTED_VERSIONS => version_ok = body == TLS13.to_be_bytes(),
+    let mut share = None;
+    for (etype, body) in &exts {
+        match *etype {
+            EXT_SUPPORTED_VERSIONS => version_ok = *body == TLS13.to_be_bytes(),
             EXT_KEY_SHARE => {
                 let mut kr = Reader::new(body);
-                if kr.u16()? != GROUP_X25519MLKEM768 {
-                    return None;
-                }
+                let group = ServerGroup::from_codepoint(kr.u16()?)?;
                 let ke = kr.vec16()?;
-                if !kr.is_empty() || ke.b.len() != HYBRID_SERVER_SHARE_LEN {
+                if !kr.is_empty() || ke.b.len() != group.share_len() {
                     return None;
                 }
-                hybrid_share = Some(ke.b.to_vec());
+                share = Some((group, ke.b.to_vec()));
             }
             _ => return None,
         }
     }
+    let (group, key_share) = share?;
     if !version_ok {
         return None;
     }
     Some(ServerHelloInfo {
         session_id,
-        cipher_suite,
-        hybrid_share: hybrid_share?,
+        shape: ServerHelloShape {
+            cipher_suite,
+            group,
+            key_share_first: exts[0].0 == EXT_KEY_SHARE,
+        },
+        key_share,
     })
+}
+
+/// Payload length of the TLS 1.3 client `Finished` record for `cipher_suite`: verify_data (32 for
+/// SHA-256 suites, 48 for `TLS_AES_256_GCM_SHA384`) + handshake header 4 + content type 1 + AEAD tag
+/// 16.
+pub fn finished_record_len(cipher_suite: u16) -> usize {
+    let verify_data = if cipher_suite == 0x1302 { 48 } else { 32 };
+    verify_data + 4 + 1 + 16
 }
 
 /// The extension types of a ClientHello record, in wire order (diagnostics / fingerprint tests).
@@ -668,8 +823,46 @@ mod tests {
         assert_eq!(rec[0], REC_HANDSHAKE);
         let info = parse_server_hello(&rec).unwrap();
         assert_eq!(info.session_id, sid);
-        assert_eq!(info.cipher_suite, SELECTED_CIPHER);
-        assert_eq!(info.hybrid_share, ks);
+        assert_eq!(info.shape, ServerHelloShape::default());
+        assert_eq!(info.key_share, ks);
+        assert_eq!(rec.len(), ServerHelloShape::default().record_len());
+    }
+
+    #[test]
+    fn server_hello_shapes_roundtrip() {
+        let sid = [3u8; 32];
+        for cipher_suite in TLS13_SUITES {
+            for group in [ServerGroup::X25519MlKem768, ServerGroup::X25519] {
+                for key_share_first in [false, true] {
+                    let shape = ServerHelloShape {
+                        cipher_suite,
+                        group,
+                        key_share_first,
+                    };
+                    let ks = share(group.share_len(), 0x11);
+                    let rec =
+                        build_server_hello_shaped(&mut StdRng::seed_from_u64(8), &sid, &shape, &ks);
+                    assert_eq!(rec.len(), shape.record_len());
+                    let info = parse_server_hello(&rec).unwrap();
+                    assert_eq!(info.shape, shape);
+                    assert_eq!(info.key_share, ks);
+                }
+            }
+        }
+        // x25519 ServerHello is the classic 127-byte record (0x7a body).
+        let x = ServerHelloShape {
+            group: ServerGroup::X25519,
+            ..ServerHelloShape::default()
+        };
+        assert_eq!(x.record_len(), 127);
+        assert_eq!(ServerHelloShape::default().record_len(), 1215);
+        // A TLS 1.2 suite or an unknown group is rejected.
+        let mut bad = build_server_hello(&mut StdRng::seed_from_u64(9), &sid, &share(1120, 0));
+        bad[SESSION_ID_OFFSET + 32..SESSION_ID_OFFSET + 34].copy_from_slice(&[0xc0, 0x2f]);
+        assert!(parse_server_hello(&bad).is_none());
+        assert_eq!(finished_record_len(0x1301), 53);
+        assert_eq!(finished_record_len(0x1303), 53);
+        assert_eq!(finished_record_len(0x1302), 69);
     }
 
     #[test]

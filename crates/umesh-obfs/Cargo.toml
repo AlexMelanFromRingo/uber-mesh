@@ -19,6 +19,9 @@ subtle.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# JA4 (SHA-256) / JA3 (MD5) oracles in tests/fingerprint.rs.
+sha2 = "0.10"
+md5 = { package = "md-5", version = "0.10" }
 
 [lints]
 workspace = true

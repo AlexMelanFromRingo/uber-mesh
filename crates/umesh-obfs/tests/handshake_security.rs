@@ -97,7 +97,9 @@ async fn read_for(s: &mut DuplexStream, dur: Duration) -> Vec<u8> {
 /// F1: an on-path attacker WITHOUT the PSK answers with a perfectly well-formed ServerHello (correct
 /// session_id echo, a real KEM response) plus a plausible CCS + encrypted flight. v1 clients accepted
 /// it and sent application data the attacker could decrypt. v2 clients must reject it and never
-/// send anything after the ClientHello.
+/// send anything after the ClientHello. (Since the client accepts any cover-shaped layout, it
+/// rejects by never finding a confirmation: the attempt ends when the forger goes quiet/closes,
+/// the record bounds are hit, or the handshake timeout fires.)
 #[tokio::test]
 async fn audit_mitm_without_psk_is_rejected_by_client() {
     let client_psk = ObfsPsk::new([0x42; 32]);
@@ -129,10 +131,7 @@ async fn audit_mitm_without_psk_is_rejected_by_client() {
     });
 
     let r = client_handshake_with(&mut c, &client_psk, &fast_cfg()).await;
-    assert!(
-        matches!(r, Err(ObfsError::AuthFailed)),
-        "client must reject a PSK-less server"
-    );
+    assert!(r.is_err(), "client must reject a PSK-less server");
     drop(c);
     let leaked = mitm.await.unwrap();
     assert!(
@@ -168,30 +167,34 @@ async fn audit_client_rejects_wrong_session_id_echo() {
 }
 
 /// On-path modification of the genuine server's flight (one bit of the ServerHello random) breaks
-/// the transcript and therefore the server's key confirmation.
+/// the transcript and therefore the server's key confirmation: the client never confirms, sends
+/// nothing more, and the server never gets a session.
 #[tokio::test]
 async fn tampered_server_hello_is_rejected() {
     let psk = ObfsPsk::new([0x21; 32]);
     let (mut c, mut mc) = tokio::io::duplex(64 * 1024);
     let (mut ms, mut s) = tokio::io::duplex(64 * 1024);
     let psk_s = psk.clone();
-    tokio::spawn(async move {
-        let _ = server_handshake(&mut s, &psk_s).await;
-    });
-    tokio::spawn(async move {
+    let server = tokio::spawn(async move { server_handshake(&mut s, &psk_s).await.is_ok() });
+    let leaked = tokio::spawn(async move {
         let ch = read_record_raw(&mut mc).await.unwrap();
         ms.write_all(&ch).await.unwrap();
         let mut sh = read_record_raw(&mut ms).await.unwrap();
         sh[20] ^= 0x01; // inside server random
         mc.write_all(&sh).await.unwrap();
-        let _ = tokio::io::copy_bidirectional(&mut mc, &mut ms).await;
+        let mut b = vec![0u8; 16 * 1024];
+        let n = ms.read(&mut b).await.unwrap();
+        mc.write_all(&b[..n]).await.unwrap();
+        read_for(&mut mc, Duration::from_secs(4)).await
     });
     let r = client_handshake_with(&mut c, &psk, &fast_cfg()).await;
+    assert!(r.is_err(), "tampered ServerHello accepted");
+    drop(c);
     assert!(
-        matches!(r, Err(ObfsError::AuthFailed)),
-        "{r:?}",
-        r = r.err()
+        leaked.await.unwrap().is_empty(),
+        "client sent nothing after the ClientHello"
     );
+    assert!(!server.await.unwrap(), "server must not get a session");
 }
 
 // ── Audit F2: replay ─────────────────────────────────────────────────────────────────────────────
@@ -436,8 +439,9 @@ async fn foreign_client_hello_forwarded_verbatim() {
 
 // ── Wire shape & round trip ──────────────────────────────────────────────────────────────────────
 
-/// Full round trip through a tap: verifies the v2 wire shape (SH → CCS → 0x17 flight of
-/// 2500–5000 B; client CCS → 53-byte Finished record) and data exchange.
+/// Full round trip through a tap: verifies the v2 wire shape without a cover profile (SH → CCS →
+/// 0x17 flight of 2500–5000 B in the PSK default layout; client CCS → 53-byte Finished record) and
+/// data exchange.
 #[tokio::test]
 async fn round_trip_with_tls13_wire_shape() {
     let psk = ObfsPsk::new([0x55; 32]);

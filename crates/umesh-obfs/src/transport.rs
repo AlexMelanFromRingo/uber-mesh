@@ -31,10 +31,15 @@ pub struct ObfsTcp;
 
 type Pending = Pin<Box<dyn Future<Output = (TcpStream, SocketAddr, ServerOutcome)> + Send>>;
 
-fn handshake_owned(mut sock: TcpStream, peer: SocketAddr, psk: ObfsPsk) -> Pending {
+fn handshake_owned(
+    mut sock: TcpStream,
+    peer: SocketAddr,
+    psk: ObfsPsk,
+    probe: ProbeResponse,
+) -> Pending {
     Box::pin(async move {
         let _ = sock.set_nodelay(true);
-        let outcome = server_handshake_core(&mut sock, &psk).await;
+        let outcome = server_handshake_core(&mut sock, &psk, &probe).await;
         (sock, peer, outcome)
     })
 }
@@ -115,7 +120,7 @@ impl ObfsTcp {
                 }
                 acc = listener.accept(), if pending.len() < DEFAULT_MAX_INFLIGHT_HANDSHAKES => {
                     let (sock, peer) = acc?;
-                    pending.push(handshake_owned(sock, peer, psk.clone()));
+                    pending.push(handshake_owned(sock, peer, psk.clone(), probe.clone()));
                 }
             }
         }
@@ -125,7 +130,9 @@ impl ObfsTcp {
 /// Options for an [`ObfsListener`].
 #[derive(Clone, Debug)]
 pub struct ListenerConfig {
-    /// What unauthenticated / probing connections get.
+    /// What unauthenticated / probing connections get — and, for [`ProbeResponse::Cover`], the cover
+    /// site whose learned TLS flight layout authenticated sessions reproduce (see
+    /// [`ListenerConfig::with_cover`]).
     pub probe: ProbeResponse,
     /// Cap on concurrently running server handshakes (probe responses run outside the cap).
     pub max_inflight_handshakes: usize,
@@ -140,6 +147,16 @@ impl Default for ListenerConfig {
             max_inflight_handshakes: DEFAULT_MAX_INFLIGHT_HANDSHAKES,
             accept_queue: DEFAULT_ACCEPT_QUEUE,
         }
+    }
+}
+
+impl ListenerConfig {
+    /// Cover mode: proxy probes to `upstream` (`host:port`) and imitate its TLS flight, learned
+    /// with SNI `domain` (default: the upstream host) now and every 30 min ± 5 min. Must be called
+    /// inside a Tokio runtime.
+    pub fn with_cover(mut self, upstream: impl Into<String>, domain: Option<&str>) -> Result<Self> {
+        self.probe = ProbeResponse::cover(upstream, domain)?;
+        Ok(self)
     }
 }
 
@@ -197,7 +214,7 @@ impl ObfsListener {
                     (psk.clone(), shaping.clone(), probe.clone(), tx.clone());
                 tokio::spawn(async move {
                     let _ = sock.set_nodelay(true);
-                    let outcome = server_handshake_core(&mut sock, &psk).await;
+                    let outcome = server_handshake_core(&mut sock, &psk, &probe).await;
                     drop(permit);
                     match outcome {
                         ServerOutcome::Accepted(keys) => {
