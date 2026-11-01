@@ -7,7 +7,7 @@
 //! - [`hash`]: BLAKE3 hashing, keyed MAC, domain-separated KDF, content IDs.
 //! - [`identity`]: Ed25519 node identity, signing, `PeerId = BLAKE3(pubkey)`.
 //! - [`aead`]: XChaCha20-Poly1305 authenticated encryption.
-//! - [`kem`]: hybrid X25519 + ML-KEM-768 key agreement (X-Wing-style combiner).
+//! - [`kem`]: hybrid X25519 + ML-KEM-768 key agreement: X-Wing (draft-connolly-cfrg-xwing-kem-11).
 //! - [`merkle`]: domain-separated BLAKE3 Merkle tree (RFC 9162 construction) membership proofs.
 //! - [`pow`]: BLAKE3 proof-of-work identity-creation friction.
 #![forbid(unsafe_code)]

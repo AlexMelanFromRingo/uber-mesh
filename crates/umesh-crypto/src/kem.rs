@@ -1,27 +1,46 @@
-//! Hybrid X25519 + ML-KEM-768 key agreement with an X-Wing-style combiner.
+//! Hybrid post-quantum key agreement: the **X-Wing** KEM (X25519 + ML-KEM-768), exactly as specified
+//! in IETF `draft-connolly-cfrg-xwing-kem-11` and verified byte-for-byte against the draft's official
+//! test vectors (`tests/xwing_kat.rs`, constitution Principle V).
 //!
-//! A break in the (unaudited) ML-KEM implementation alone cannot compromise a session: the X25519
-//! shared secret is mixed into the combiner, keeping the result secret as long as either KEM holds
-//! (constitution Principle I; research D4). The combiner is `BLAKE3.derive_key("…xwing",
-//! ss_mlkem ‖ ss_x25519 ‖ mlkem_ct ‖ x25519_initiator_pub ‖ x25519_responder_pub)`.
+//! X-Wing in the two-flight shape used by the handshake:
 //!
-//! Every intermediate secret (X25519 DH output, ML-KEM shared key, combiner input buffer) is wiped
-//! after use, and the combined output is returned as a [`SharedSecret`] that zeroizes on drop,
-//! redacts itself in `Debug`, and compares in constant time.
+//! - **Initiator = key generation.** A fresh 32-byte decapsulation seed `sk` is expanded with
+//!   `SHAKE256(sk, 96 bytes)`: bytes `0..64` are the ML-KEM-768 `KeyGen_internal(d, z)` seed and bytes
+//!   `64..96` are the X25519 secret `sk_X`. The first flight is the X-Wing encapsulation key
+//!   `pk = pk_M (1184) ‖ pk_X (32)`.
+//! - **Responder = encapsulation.** With a fresh 64-byte `eseed`, ML-KEM encapsulates with
+//!   `m = eseed[0..32]` and the ephemeral X25519 secret is `eseed[32..64]`. The second flight is the
+//!   X-Wing ciphertext `ct = ct_M (1088) ‖ ct_X (32)`.
+//! - **Combiner.** `ss = SHA3-256(ss_M ‖ ss_X ‖ ct_X ‖ pk_X ‖ XWingLabel)` with
+//!   `XWingLabel = "\./" ‖ "/^\"` (hex `5c2e2f2f5e5c`).
+//!
+//! Both flights are byte-identical to the IANA `X25519MLKEM768` (`0x11EC`) TLS key-share layout
+//! (client: ek ‖ X25519 pub; server: ct ‖ X25519 pub), so the obfs TLS mimicry is unaffected.
+//!
+//! The session stays secret as long as *either* X25519 or ML-KEM-768 holds (constitution
+//! Principle I). As a strictly-stricter local policy on top of the draft, non-contributory
+//! (low-order / all-zero) X25519 inputs are rejected (RFC 7748 §6.1); honest X-Wing peers never
+//! produce such keys, so this does not affect conformance.
+//!
+//! Every intermediate secret (seed, SHAKE output, X25519 DH output, ML-KEM shared key, hash state)
+//! is wiped after use, and the combined output is returned as a [`SharedSecret`] that zeroizes on
+//! drop, redacts itself in `Debug`, and compares in constant time.
 
 use core::fmt;
 
-use ml_kem::MlKem768;
-use ml_kem::kem::{Decapsulate, Encapsulate, Kem, Key as MlKey, KeyExport};
+use ml_kem::kem::{Decapsulate, Key as MlKey, KeyExport};
 use ml_kem::ml_kem_768::{Ciphertext as MlCiphertext, DecapsulationKey, EncapsulationKey};
+use ml_kem::{B32, Seed as MlSeed};
 use rand::RngCore;
 use rand::rngs::OsRng;
+use sha3::Sha3_256;
+use sha3::digest::{FixedOutput, Update};
+use shake::{ExtendableOutput, Shake256, XofReader};
 use subtle::{Choice, ConstantTimeEq};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::error::{CryptoError, Result};
-use crate::hash;
 
 /// X25519 public key length.
 pub const X25519_LEN: usize = 32;
@@ -31,6 +50,18 @@ pub const MLKEM768_EK_LEN: usize = 1184;
 pub const MLKEM768_CT_LEN: usize = 1088;
 /// Length of the combined hybrid shared secret.
 pub const SHARED_SECRET_LEN: usize = 32;
+/// X-Wing decapsulation-key (seed) length.
+pub const XWING_SEED_LEN: usize = 32;
+/// X-Wing encapsulation randomness (`eseed`) length.
+pub const XWING_ESEED_LEN: usize = 64;
+/// X-Wing encapsulation-key length: `pk_M ‖ pk_X`.
+pub const XWING_PK_LEN: usize = MLKEM768_EK_LEN + X25519_LEN;
+/// X-Wing ciphertext length: `ct_M ‖ ct_X`.
+pub const XWING_CT_LEN: usize = MLKEM768_CT_LEN + X25519_LEN;
+
+/// The X-Wing combiner label `"\./" ‖ "/^\"` (draft §5.3), hex `5c2e2f2f5e5c`. Fixed by the
+/// standard — deliberately not an uber-mesh `hash::labels` entry.
+pub const XWING_LABEL: [u8; 6] = *b"\\.//^\\";
 
 /// The 32-byte combined hybrid shared secret.
 ///
@@ -73,26 +104,48 @@ impl fmt::Debug for SharedSecret {
     }
 }
 
-/// X-Wing-style combiner. All inputs are available to both parties after the exchange. Both
-/// ephemeral X25519 public keys are bound (not just the initiator's) so a tampered responder key is
-/// cryptographically detectable in the derived secret, matching standard hybrid-binding practice.
+/// X-Wing `Combiner(ss_M, ss_X, ct_X, pk_X)` = `SHA3-256(ss_M ‖ ss_X ‖ ct_X ‖ pk_X ‖ XWingLabel)`.
+/// `ct_X` is the responder's ephemeral X25519 public key, `pk_X` the initiator's.
 fn combine(
-    ss_mlkem: &[u8],
-    ss_x25519: &[u8; 32],
-    mlkem_ct: &[u8],
-    initiator_x_pub: &[u8; 32],
-    responder_x_pub: &[u8; 32],
+    ss_m: &[u8],
+    ss_x: &[u8; 32],
+    ct_x: &[u8; X25519_LEN],
+    pk_x: &[u8; X25519_LEN],
 ) -> SharedSecret {
-    // Exact capacity: no reallocation, so no stray un-wiped copy of the secrets on the heap.
-    let mut buf = Zeroizing::new(Vec::with_capacity(
-        ss_mlkem.len() + 32 + mlkem_ct.len() + 32 + 32,
-    ));
-    buf.extend_from_slice(ss_mlkem);
-    buf.extend_from_slice(ss_x25519);
-    buf.extend_from_slice(mlkem_ct);
-    buf.extend_from_slice(initiator_x_pub);
-    buf.extend_from_slice(responder_x_pub);
-    SharedSecret(hash::derive_key(hash::labels::XWING, &buf))
+    // `sha3/zeroize`: the sponge state (which absorbed ss_M, ss_X) is wiped when `h` is consumed.
+    let mut h = Sha3_256::default();
+    h.update(ss_m);
+    h.update(ss_x);
+    h.update(ct_x);
+    h.update(pk_x);
+    h.update(&XWING_LABEL);
+    let mut out = h.finalize_fixed();
+    let ss = SharedSecret(out.into());
+    out.as_mut_slice().zeroize();
+    ss
+}
+
+/// X-Wing `expandDecapsulationKey(sk)`: `SHAKE256(sk, 96 bytes)` → (ML-KEM-768 key from
+/// `expanded[0..64]` = `d ‖ z`, X25519 secret `expanded[64..96]`, its public key `pk_X`).
+fn expand_decapsulation_key(
+    sk: &[u8; XWING_SEED_LEN],
+) -> (DecapsulationKey, StaticSecret, [u8; X25519_LEN]) {
+    let mut xof = Shake256::default();
+    xof.update(sk);
+    let mut expanded = Zeroizing::new([0u8; 96]);
+    xof.finalize_xof().read(&mut expanded[..]);
+
+    let mut ml_seed = MlSeed::default();
+    ml_seed.copy_from_slice(&expanded[..64]);
+    let ml_dk = DecapsulationKey::from_seed(ml_seed);
+    ml_seed.as_mut_slice().zeroize();
+
+    let mut sk_x = [0u8; 32];
+    sk_x.copy_from_slice(&expanded[64..]);
+    let x_secret = StaticSecret::from(sk_x);
+    sk_x.zeroize();
+    let pk_x = PublicKey::from(&x_secret).to_bytes();
+    (ml_dk, x_secret, pk_x)
 }
 
 /// X25519 DH that rejects non-contributory (low-order / all-zero) peer keys (RFC 7748 §6.1), so a
@@ -106,33 +159,79 @@ fn x25519_dh(secret: &StaticSecret, peer: &[u8; X25519_LEN]) -> Result<x25519_da
     }
 }
 
-fn random_x25519_secret() -> StaticSecret {
-    let mut seed = [0u8; 32];
-    OsRng.fill_bytes(&mut seed);
-    let s = StaticSecret::from(seed);
-    seed.zeroize();
-    s
-}
-
-/// First handshake flight (initiator → responder): X25519 public key + ML-KEM encapsulation key.
+/// First handshake flight (initiator → responder): the X-Wing encapsulation key, kept split into
+/// its ML-KEM and X25519 halves. [`InitiatorMessage::to_bytes`] gives the 1216-byte X-Wing `pk`.
 #[derive(Clone)]
 pub struct InitiatorMessage {
-    /// X25519 ephemeral public key (32 bytes).
+    /// X25519 public key `pk_X` (32 bytes).
     pub x25519_pub: [u8; X25519_LEN],
-    /// ML-KEM-768 encapsulation key (1184 bytes).
+    /// ML-KEM-768 encapsulation key `pk_M` (1184 bytes).
     pub mlkem_ek: Vec<u8>,
 }
 
-/// Second handshake flight (responder → initiator): X25519 public key + ML-KEM ciphertext.
+impl InitiatorMessage {
+    /// Serialize as the X-Wing encapsulation key `pk_M ‖ pk_X` (also the `X25519MLKEM768` client
+    /// key-share layout).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(XWING_PK_LEN);
+        out.extend_from_slice(&self.mlkem_ek);
+        out.extend_from_slice(&self.x25519_pub);
+        out
+    }
+
+    /// Parse a 1216-byte X-Wing encapsulation key `pk_M ‖ pk_X`. Only the length is checked here;
+    /// the ML-KEM key check (FIPS 203 §7.2) runs in [`respond`].
+    pub fn from_bytes(pk: &[u8]) -> Result<Self> {
+        if pk.len() != XWING_PK_LEN {
+            return Err(CryptoError::MalformedKey);
+        }
+        let (pk_m, pk_x) = pk.split_at(MLKEM768_EK_LEN);
+        let mut x25519_pub = [0u8; X25519_LEN];
+        x25519_pub.copy_from_slice(pk_x);
+        Ok(Self {
+            x25519_pub,
+            mlkem_ek: pk_m.to_vec(),
+        })
+    }
+}
+
+/// Second handshake flight (responder → initiator): the X-Wing ciphertext, kept split into its
+/// ML-KEM and X25519 halves. [`ResponderMessage::to_bytes`] gives the 1120-byte X-Wing `ct`.
 #[derive(Clone)]
 pub struct ResponderMessage {
-    /// X25519 ephemeral public key (32 bytes).
+    /// X25519 ephemeral public key `ct_X` (32 bytes).
     pub x25519_pub: [u8; X25519_LEN],
-    /// ML-KEM-768 ciphertext (1088 bytes).
+    /// ML-KEM-768 ciphertext `ct_M` (1088 bytes).
     pub mlkem_ct: Vec<u8>,
 }
 
-/// Initiator handshake state held between the two flights.
+impl ResponderMessage {
+    /// Serialize as the X-Wing ciphertext `ct_M ‖ ct_X` (also the `X25519MLKEM768` server key-share
+    /// layout).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(XWING_CT_LEN);
+        out.extend_from_slice(&self.mlkem_ct);
+        out.extend_from_slice(&self.x25519_pub);
+        out
+    }
+
+    /// Parse a 1120-byte X-Wing ciphertext `ct_M ‖ ct_X`.
+    pub fn from_bytes(ct: &[u8]) -> Result<Self> {
+        if ct.len() != XWING_CT_LEN {
+            return Err(CryptoError::MalformedKey);
+        }
+        let (ct_m, ct_x) = ct.split_at(MLKEM768_CT_LEN);
+        let mut x25519_pub = [0u8; X25519_LEN];
+        x25519_pub.copy_from_slice(ct_x);
+        Ok(Self {
+            x25519_pub,
+            mlkem_ct: ct_m.to_vec(),
+        })
+    }
+}
+
+/// Initiator handshake state held between the two flights: the *expanded* X-Wing decapsulation key
+/// (draft §5.5 explicitly allows caching it locally; it is never transmitted).
 pub struct Initiator {
     x_secret: StaticSecret,
     x_pub: [u8; X25519_LEN],
@@ -140,14 +239,20 @@ pub struct Initiator {
 }
 
 impl Initiator {
-    /// Begin a hybrid handshake, producing the first flight.
+    /// Begin a hybrid handshake: X-Wing `GenerateKeyPair()` with a fresh 32-byte OsRng seed,
+    /// producing the first flight.
     pub fn start() -> (Self, InitiatorMessage) {
-        let x_secret = random_x25519_secret();
-        let x_pub = PublicKey::from(&x_secret).to_bytes();
+        let mut sk = Zeroizing::new([0u8; XWING_SEED_LEN]);
+        OsRng.fill_bytes(&mut sk[..]);
+        Self::start_derand(&sk)
+    }
 
-        let (ml_dk, ml_ek) = MlKem768::generate_keypair();
-        let mlkem_ek = ml_ek.to_bytes().as_slice().to_vec();
-
+    /// X-Wing `GenerateKeyPairDerand(sk)`. **Known-answer tests only**: production code MUST use
+    /// [`Initiator::start`]; a non-uniform or reused `sk` is a catastrophic key compromise.
+    #[doc(hidden)]
+    pub fn start_derand(sk: &[u8; XWING_SEED_LEN]) -> (Self, InitiatorMessage) {
+        let (ml_dk, x_secret, x_pub) = expand_decapsulation_key(sk);
+        let mlkem_ek = ml_dk.encapsulation_key().to_bytes().as_slice().to_vec();
         let msg = InitiatorMessage {
             x25519_pub: x_pub,
             mlkem_ek,
@@ -162,53 +267,67 @@ impl Initiator {
         )
     }
 
-    /// Complete the handshake from the responder's flight, yielding the shared secret.
+    /// X-Wing `Decapsulate`: complete the handshake from the responder's flight, yielding the
+    /// shared secret.
     pub fn finish(self, resp: &ResponderMessage) -> Result<SharedSecret> {
         // `x25519_dalek::SharedSecret` is ZeroizeOnDrop; never copied out.
         let ss_x = x25519_dh(&self.x_secret, &resp.x25519_pub)?;
 
         let ct = MlCiphertext::try_from(resp.mlkem_ct.as_slice())
             .map_err(|_| CryptoError::MalformedKey)?;
-        let mut ss_pq = self.ml_dk.decapsulate(&ct); // infallible (implicit rejection)
+        let mut ss_m = self.ml_dk.decapsulate(&ct); // infallible (implicit rejection)
 
         let ss = combine(
-            ss_pq.as_slice(),
+            ss_m.as_slice(),
             ss_x.as_bytes(),
-            &resp.mlkem_ct,
-            &self.x_pub,
             &resp.x25519_pub,
+            &self.x_pub,
         );
-        ss_pq.as_mut_slice().zeroize();
+        ss_m.as_mut_slice().zeroize();
         Ok(ss)
-        // `self` (StaticSecret + ML-KEM DecapsulationKey, both ZeroizeOnDrop) is dropped here.
+        // `self` (StaticSecret + ML-KEM DecapsulationKey, both wipe on drop) is dropped here.
     }
 }
 
-/// Responder side: consume the initiator flight, produce the response, and derive the shared secret.
+/// Responder side (X-Wing `Encapsulate` with 64 fresh OsRng bytes): consume the initiator flight,
+/// produce the response, and derive the shared secret.
 pub fn respond(init: &InitiatorMessage) -> Result<(SharedSecret, ResponderMessage)> {
-    let x_secret = random_x25519_secret();
-    let x_pub = PublicKey::from(&x_secret).to_bytes();
-    let ss_x = x25519_dh(&x_secret, &init.x25519_pub)?;
+    let mut eseed = Zeroizing::new([0u8; XWING_ESEED_LEN]);
+    OsRng.fill_bytes(&mut eseed[..]);
+    respond_derand(init, &eseed)
+}
 
+/// X-Wing `EncapsulateDerand(pk, eseed)`. **Known-answer tests only**: production code MUST use
+/// [`respond`]; a non-uniform or reused `eseed` is a catastrophic key compromise.
+#[doc(hidden)]
+pub fn respond_derand(
+    init: &InitiatorMessage,
+    eseed: &[u8; XWING_ESEED_LEN],
+) -> Result<(SharedSecret, ResponderMessage)> {
+    // ML-KEM-768 encapsulation-key check (FIPS 203 §7.2), required by the draft.
     let ek_key = MlKey::<EncapsulationKey>::try_from(init.mlkem_ek.as_slice())
         .map_err(|_| CryptoError::MalformedKey)?;
     let ek = EncapsulationKey::new(&ek_key).map_err(|_| CryptoError::MalformedKey)?;
-    let (ct, mut ss_pq) = ek.encapsulate();
-    let mlkem_ct = ct.as_slice().to_vec();
 
-    let ss = combine(
-        ss_pq.as_slice(),
-        ss_x.as_bytes(),
-        &mlkem_ct,
-        &init.x25519_pub,
-        &x_pub,
-    );
-    ss_pq.as_mut_slice().zeroize();
+    let mut ek_x = [0u8; 32];
+    ek_x.copy_from_slice(&eseed[32..]);
+    let x_secret = StaticSecret::from(ek_x);
+    ek_x.zeroize();
+    let ct_x = PublicKey::from(&x_secret).to_bytes();
+    let ss_x = x25519_dh(&x_secret, &init.x25519_pub)?;
+
+    let mut m = B32::default();
+    m.copy_from_slice(&eseed[..32]);
+    let (ct_m, mut ss_m) = ek.encapsulate_deterministic(&m);
+    m.as_mut_slice().zeroize();
+
+    let ss = combine(ss_m.as_slice(), ss_x.as_bytes(), &ct_x, &init.x25519_pub);
+    ss_m.as_mut_slice().zeroize();
     Ok((
         ss,
         ResponderMessage {
-            x25519_pub: x_pub,
-            mlkem_ct,
+            x25519_pub: ct_x,
+            mlkem_ct: ct_m.as_slice().to_vec(),
         },
     ))
 }
@@ -218,19 +337,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn xwing_label_matches_draft() {
+        assert_eq!(XWING_LABEL, [0x5c, 0x2e, 0x2f, 0x2f, 0x5e, 0x5c]);
+    }
+
+    #[test]
     fn hybrid_handshake_agrees() {
         let (initiator, init_msg) = Initiator::start();
         assert_eq!(init_msg.x25519_pub.len(), X25519_LEN);
         assert_eq!(init_msg.mlkem_ek.len(), MLKEM768_EK_LEN);
+        assert_eq!(init_msg.to_bytes().len(), XWING_PK_LEN);
 
         let (ss_responder, resp_msg) = respond(&init_msg).unwrap();
         assert_eq!(resp_msg.mlkem_ct.len(), MLKEM768_CT_LEN);
+        assert_eq!(resp_msg.to_bytes().len(), XWING_CT_LEN);
 
         let ss_initiator = initiator.finish(&resp_msg).unwrap();
         assert_eq!(
             ss_initiator, ss_responder,
             "both sides must derive the same secret"
         );
+    }
+
+    #[test]
+    fn message_bytes_round_trip() {
+        let (_i, m) = Initiator::start();
+        let m2 = InitiatorMessage::from_bytes(&m.to_bytes()).unwrap();
+        assert_eq!(m2.to_bytes(), m.to_bytes());
+        let (_ss, r) = respond(&m).unwrap();
+        let r2 = ResponderMessage::from_bytes(&r.to_bytes()).unwrap();
+        assert_eq!(r2.to_bytes(), r.to_bytes());
+        assert!(InitiatorMessage::from_bytes(&[0u8; XWING_PK_LEN - 1]).is_err());
+        assert!(ResponderMessage::from_bytes(&[0u8; XWING_CT_LEN + 1]).is_err());
+    }
+
+    #[test]
+    fn keygen_is_deterministic_in_seed() {
+        let (_a, ma) = Initiator::start_derand(&[7u8; 32]);
+        let (_b, mb) = Initiator::start_derand(&[7u8; 32]);
+        let (_c, mc) = Initiator::start_derand(&[8u8; 32]);
+        assert_eq!(ma.to_bytes(), mb.to_bytes());
+        assert_ne!(ma.to_bytes(), mc.to_bytes());
     }
 
     #[test]
@@ -260,6 +407,16 @@ mod tests {
     }
 
     #[test]
+    fn tampered_x25519_ciphertext_breaks_agreement() {
+        let (initiator, init_msg) = Initiator::start();
+        let (ss_r, mut resp_msg) = respond(&init_msg).unwrap();
+        resp_msg.x25519_pub[5] ^= 0x01;
+        if let Ok(ss_i) = initiator.finish(&resp_msg) {
+            assert_ne!(ss_i, ss_r);
+        }
+    }
+
+    #[test]
     fn shared_secret_debug_is_redacted() {
         let (initiator, init_msg) = Initiator::start();
         let (ss, resp) = respond(&init_msg).unwrap();
@@ -281,6 +438,8 @@ mod tests {
         z::<StaticSecret>();
         z::<x25519_dalek::SharedSecret>();
         zod::<DecapsulationKey>(); // requires ml-kem `zeroize`
+        zod::<Sha3_256>(); // requires sha3 `zeroize`
+        zod::<Shake256>(); // requires shake `zeroize`
     }
 
     /// RFC 7748 §6.1: an all-zero / low-order X25519 key would zero the classical half of the

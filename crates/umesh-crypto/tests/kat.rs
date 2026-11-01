@@ -2,8 +2,9 @@
 //!
 //! - BLAKE3 empty-input vector (also covered inline in `hash`).
 //! - X25519 RFC 7748 §5.2 first scalar-multiplication vector.
-//! - Hybrid X25519+ML-KEM-768 handshake agreement (correctness via agreement, not a fixed vector,
-//!   since the combiner is uber-mesh-specific; full ML-KEM ACVP KATs are covered upstream in `ml-kem`).
+//! - Hybrid X25519+ML-KEM-768 handshake agreement and sizes. The byte-exact X-Wing conformance
+//!   vectors (draft-connolly-cfrg-xwing-kem-11) live in `tests/xwing_kat.rs`; full ML-KEM ACVP KATs
+//!   are covered upstream in `ml-kem`.
 
 use umesh_crypto::{hash, kem};
 
